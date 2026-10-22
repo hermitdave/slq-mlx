@@ -44,7 +44,7 @@ def select_layers_mlx(module: nn.Module, pattern: str) -> Dict[str, nn.Linear]:
 
     Args:
         module: Module to search (e.g., a TransformerBlock)
-        pattern: Regex pattern for layer names (e.g., "self_attn.(q|k|v)_proj|mlp.(gate|up|down)_proj")
+        pattern: Regex pattern for layer names (e.g., "self_attn.(q|k|v|o)_proj|mlp.(gate|up|down)_proj")
 
     Returns:
         Dict mapping layer name -> Linear module

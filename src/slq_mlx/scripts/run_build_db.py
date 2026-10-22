@@ -30,7 +30,9 @@ def main():
     parser.add_argument("--shapley-bitwidths", default="2,3,4,5,6,7,8")
     parser.add_argument("--num-permutations", type=int, default=50)
     parser.add_argument("--skip-shapley", action="store_true")
-    parser.add_argument("--layer-groups", default="mlp.gate_proj,mlp.up_proj self_attn.k_proj,self_attn.q_proj,self_attn.v_proj")
+    parser.add_argument("--layer-groups", default="mlp.gate_proj,mlp.up_proj self_attn.k_proj,self_attn.q_proj,self_attn.v_proj,self_attn.o_proj",
+                        help="Groups of layers constrained to share a bitwidth (space-separated groups, "
+                             "comma-separated patterns).")
     parser.add_argument("--force-recompute", action="store_true")
 
     args = parser.parse_args()

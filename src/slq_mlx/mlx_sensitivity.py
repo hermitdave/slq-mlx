@@ -6,6 +6,7 @@ Ported from SLQ src/sensitivity/database.py and slq_build_database.py
 import hashlib
 import json
 import logging
+from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
@@ -14,7 +15,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .mlx_metrics import compute_all_metrics, compute_baseline_topk
-from .mlx_model_utils import get_layer_weights, set_layer_weights
+from .mlx_model_utils import get_layer_weights, get_submodule, set_layer_weights
 from .mlx_weight_store import ErrorDatabase, LayerGroup, WeightStore, compute_layer_error
 from .mlx_data import prepare_calibration_data
 
@@ -59,35 +60,85 @@ class ShapleySensitivityData:
 
 
 class GPUWeightCache:
-    """In-memory weight cache for fast Shapley permutation swapping.
+    """Weight cache for Shapley permutation swapping.
 
-    On MLX unified memory, this is just a dict of pre-loaded weights.
+    The baseline (every layer at ``max_bw``) is pinned and loaded once; weights at
+    the other bitwidths are dequantized on demand and evicted LRU once the cache
+    exceeds ``max_cache_bytes``.
+
+    The original implementation preloaded every layer at every bitwidth. That
+    OOM-killed on the 3.4 GB Qwen3-1.7B model and would need roughly 150 GB of
+    unified memory at 27B -- the Shapley pass only ever holds two bitwidths at a
+    time (the baseline plus the target level), so preloading all of them is pure
+    waste.
     """
 
-    def __init__(self, model: nn.Module, weight_store: WeightStore, bitwidths: List[int], preload: bool = True):
+    def __init__(
+        self,
+        model: nn.Module,
+        weight_store: WeightStore,
+        bitwidths: List[int],
+        preload: bool = True,
+        max_cache_bytes: int = 6 * 2**30,
+    ):
         self.model = model
         self.weight_store = weight_store
-        self.bitwidths = bitwidths
+        self.bitwidths = list(bitwidths)
         self.max_bw = max(bitwidths)
-        self.cached_weights: Dict[Tuple[str, int], mx.array] = {}
+        self.max_cache_bytes = max_cache_bytes
+
+        self._pinned: Dict[str, mx.array] = {}
+        self._cached: "OrderedDict[Tuple[str, int], mx.array]" = OrderedDict()
+        self._cache_bytes = 0
         self.current_bw: Dict[str, int] = {}
+        # MLX arrays are immutable value types and weights are replaced by
+        # reference, so holding the array is enough -- mx.array has no .copy().
         self.original_weights: Dict[str, mx.array] = {}
 
-        # Store original weights
         for name in weight_store.get_layer_names():
-            layer = model.get_submodule(name)
-            self.original_weights[name] = layer.weight.copy()
+            self.original_weights[name] = get_submodule(model, name).weight
 
         if preload:
-            self._preload_all()
+            self._preload_baseline()
 
-    def _preload_all(self):
-        """Preload all quantized weights for all layers and bitwidths."""
-        logger.info("Preloading weights for Shapley estimation...")
-        for name in self.weight_store.get_layer_names():
-            for bw in self.bitwidths:
-                self.cached_weights[(name, bw)] = self.weight_store.get_layer_weight(name, bw)
-        mx.eval([w for w in self.cached_weights.values()])
+    def _preload_baseline(self):
+        """Load every layer at the maximum bitwidth; this is the Shapley baseline."""
+        names = list(self.original_weights)
+        logger.info(f"Preloading baseline: {len(names)} layers at {self.max_bw}-bit ...")
+        for name in names:
+            self._pinned[name] = self.weight_store.get_layer_weight(name, self.max_bw)
+            self.current_bw[name] = self.max_bw
+        mx.eval(list(self._pinned.values()))
+        logger.info(f"Baseline resident: {self._bytes(list(self._pinned.values())) / 2**30:.2f} GiB")
+
+    @staticmethod
+    def _bytes(arrays) -> int:
+        return sum(int(a.nbytes) for a in arrays)
+
+    def _evict_until(self, incoming: int):
+        while self._cached and self._cache_bytes + incoming > self.max_cache_bytes:
+            _, evicted = self._cached.popitem(last=False)
+            self._cache_bytes -= int(evicted.nbytes)
+            mx.eval(mx.zeros(1))
+
+    def _get(self, name: str, bitwidth: int) -> mx.array:
+        if bitwidth == self.max_bw and name in self._pinned:
+            return self._pinned[name]
+
+        key = (name, bitwidth)
+        if key in self._cached:
+            self._cached.move_to_end(key)
+            return self._cached[key]
+
+        weight = self.weight_store.get_layer_weight(name, bitwidth)
+        self._evict_until(int(weight.nbytes))
+        self._cached[key] = weight
+        self._cache_bytes += int(weight.nbytes)
+        return weight
+
+    def cache_stats(self) -> str:
+        return (f"{len(self._pinned)} pinned, {len(self._cached)} cached, "
+                f"{self._cache_bytes / 2**30:.2f} GiB target cache")
 
     def swap_all_layers(self, model: nn.Module, target_bw: Dict[str, int]):
         """Swap all layers to target bitwidths."""
@@ -96,10 +147,7 @@ class GPUWeightCache:
 
     def swap_layer(self, model: nn.Module, name: str, bitwidth: int):
         """Swap a single layer to target bitwidth."""
-        weight = self.cached_weights.get((name, bitwidth))
-        if weight is None:
-            weight = self.weight_store.get_layer_weight(name, bitwidth)
-            self.cached_weights[(name, bitwidth)] = weight
+        weight = self._get(name, bitwidth)
         set_layer_weights(model, name, weight)
         self.current_bw[name] = bitwidth
         mx.eval(weight)  # Materialize
@@ -338,7 +386,9 @@ def run_build_database(
 
     # Linear alphas
     if not skip_linear and (force_recompute or not linear_path.exists()):
-        original_weights = {n: get_layer_weights(model, n).copy() for n in error_db.layer_names}
+        # MLX arrays are immutable value types; weights are swapped by reference,
+        # so holding the array is sufficient (mx.array has no .copy()).
+        original_weights = {n: get_layer_weights(model, n) for n in error_db.layer_names}
         nll_a, kl_a, ear_a = estimate_linear_alphas(model, original_weights, groups, metric_fn, num_noise_samples)
         save_json(LinearSensitivityData(
             nll_alphas=nll_a, kl_alphas=kl_a, ear_alphas=ear_a,
@@ -371,9 +421,3 @@ def load_model(model_id: str) -> nn.Module:
 def get_tokenizer(model_id: str):
     from .mlx_data import get_tokenizer
     return get_tokenizer(model_id)
-
-def load_model(model_id: str) -> nn.Module:
-    """Load model for calibration."""
-    from mlx_lm import load
-    model, _ = load(model_id)
-    return model

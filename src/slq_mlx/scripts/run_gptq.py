@@ -25,7 +25,9 @@ logger = logging.getLogger(__name__)
 def main():
     parser = argparse.ArgumentParser(description="One-shot parallel GPTQ at multiple bitwidths")
     parser.add_argument("--model", required=True, help="HF model ID or local path")
-    parser.add_argument("--quantizable-modules", default="self_attn.(q|k|v)_proj|mlp.(gate|up|down)_proj")
+    parser.add_argument("--quantizable-modules", default="self_attn.(q|k|v|o)_proj|mlp.(gate|up|down)_proj",
+                        help="Regex matching Linear layers to quantize. Must include o_proj: leaving it out "
+                             "keeps the attention output projection at BF16 (the 1.7B run silently dropped 117M params).")
     parser.add_argument("--pre-block-modules", nargs="+", default=["embed_tokens", "norm"])
     parser.add_argument("--block-modules", default="layers")
     parser.add_argument("--calibration-data", default="fineweb_edu", choices=["fineweb_edu", "wikitext2", "c4"])

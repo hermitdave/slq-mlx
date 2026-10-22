@@ -118,7 +118,11 @@ def main():
     source.add_argument("--uniform", type=int, metavar="BITS", help="every layer at BITS (e.g. TL anchor)")
     parser.add_argument("--output-dir", required=True, help="writes <output-dir>/<model>/<subdir>")
     parser.add_argument("--subdir-name", default=None, help="default: config stem without 'config_', or uniform<BITS>")
-    parser.add_argument("--dtype", default="bfloat16", choices=["float16", "bfloat16", "float32"])
+    parser.add_argument("--dtype", default="float16", choices=["float16", "float32"],
+                        help="On-disk weight dtype. float16 is 2 bytes/param -- identical to BF16, so the "
+                             "artifact is never larger than its BF16 base. bfloat16 cannot be serialised "
+                             "by safetensors.mlx (no PEP 3118 buffer format), which is why the old default "
+                             "silently doubled the artifact to float32.")
     parser.add_argument("--group-size", type=int, default=128, help="must match the layer store")
     parser.add_argument("--force", action="store_true", help="overwrite existing output directory")
     args = parser.parse_args()
@@ -184,15 +188,18 @@ def main():
 
     nested_params = model.parameters()
     flat_params = flatten_params(nested_params)
-    state_dict = {}
-    for k, v in flat_params.items():
-        # Keep 'model.' prefix - mlx_lm expects it
-        state_dict[k] = v
-    # Convert bfloat16 to float32 for safetensors compatibility
-    for k, v in state_dict.items():
-        if v.dtype == mx.bfloat16:
-            state_dict[k] = v.astype(mx.float32)
+
+    # safetensors.mlx cannot serialise bfloat16, so weights are written as
+    # float16: 2 bytes/param, exactly the BF16 footprint. Writing float32 here
+    # (the previous behaviour) made the quantised model 2x its BF16 base.
+    save_dtype = mx.float16 if args.dtype == "float16" else mx.float32
+    state_dict = {
+        k: (v.astype(save_dtype) if isinstance(v, mx.array) else v)
+        for k, v in flat_params.items()
+    }
     save_file(state_dict, str(out / "model.safetensors"))
+    total_bytes = sum(int(v.nbytes) for v in state_dict.values())
+    logger.info(f"Saved weights: {total_bytes / 2**30:.2f} GiB as {args.dtype}")
 
     # Save model config
     import json

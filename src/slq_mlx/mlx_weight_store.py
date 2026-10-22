@@ -102,43 +102,61 @@ class WeightStore:
         return qweight, scales, zeros, group_size
 
     def _load_qparams(self, layer_name: str, bitwidth: int) -> Tuple[mx.array, mx.array, mx.array, int]:
-        """Load qweight, scales, zeros, and group_size from disk."""
+        """Load qweight, scales, zeros, and group_size from disk.
+
+        Prefers the binary ``{bw}_qparams.npz`` layout and falls back to the
+        legacy ``{bw}_qparams.json`` so existing stores stay readable.
+        """
         layer_dir = os.path.join(self.base_dir, layer_name)
 
         # Load qweight
         qweight_path = os.path.join(layer_dir, f"{bitwidth}.npy")
         qweight = mx.array(np.load(qweight_path))
 
-        # Load qparams
-        qparams_path = os.path.join(layer_dir, f"{bitwidth}_qparams.json")
-        with open(qparams_path, "r") as f:
-            qparams = json.load(f)
+        npz_path = os.path.join(layer_dir, f"{bitwidth}_qparams.npz")
+        json_path = os.path.join(layer_dir, f"{bitwidth}_qparams.json")
 
-        scales = mx.array(qparams["scales"])
-        zeros = mx.array(qparams["zeros"])
-        group_size = qparams.get("group_size", 128)
+        if os.path.exists(npz_path):
+            with np.load(npz_path) as z:
+                scales = mx.array(z["scales"])
+                zeros = mx.array(z["zeros"])
+                group_size = int(z["group_size"])
+        elif os.path.exists(json_path):
+            with open(json_path, "r") as f:
+                qparams = json.load(f)
+            scales = mx.array(qparams["scales"])
+            zeros = mx.array(qparams["zeros"])
+            group_size = qparams.get("group_size", 128)
+        else:
+            raise FileNotFoundError(
+                f"No qparams for {layer_name} at {bitwidth}-bit "
+                f"(looked for {npz_path} and {json_path})"
+            )
 
         return qweight, scales, zeros, group_size
 
 
 def save_qparams(layer_dir: str, bitwidth: int, qweight: mx.array, scales: mx.array, zeros: mx.array, handle):
-    """Save quantization parameters alongside quantized weight."""
-    # Save qweight as numpy
-    import numpy as np
-    np.save(os.path.join(layer_dir, f"{bitwidth}.npy"), np.array(qweight))
+    """Save quantization parameters alongside quantized weight.
 
-    # Save qparams as JSON
-    qparams = {
-        "scales": np.array(scales).tolist(),
-        "zeros": np.array(zeros).tolist(),
-        "group_size": handle.group_size,
-        "sym": handle.sym,
-        "perchannel": handle.perchannel,
-        "bitwidth": bitwidth,
-        "shape": list(qweight.shape),
-    }
-    with open(os.path.join(layer_dir, f"{bitwidth}_qparams.json"), "w") as f:
-        json.dump(qparams, f, indent=2)
+    Scales/zeros are written as a binary ``.npz`` rather than JSON: measured on
+    the Qwen3-1.7B store, JSON text cost 0.443 bytes per param-bitwidth against
+    0.0625 for float32 binary -- a 7x difference, and 30% of the whole store.
+    """
+    np.save(
+        os.path.join(layer_dir, f"{bitwidth}.npy"),
+        np.asarray(qweight),
+    )
+    np.savez(
+        os.path.join(layer_dir, f"{bitwidth}_qparams.npz"),
+        scales=np.asarray(scales, dtype=np.float32),
+        zeros=np.asarray(zeros, dtype=np.float32),
+        group_size=np.int64(handle.group_size),
+        sym=np.int8(bool(handle.sym)),
+        perchannel=np.int8(bool(handle.perchannel)),
+        bitwidth=np.int64(bitwidth),
+        shape=np.asarray(qweight.shape, dtype=np.int64),
+    )
 
 
 class ErrorDatabase:

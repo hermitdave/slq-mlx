@@ -135,9 +135,9 @@ quant/
     └── 4bit/
         ├── model.layers.0.self_attn.q_proj/
         │   ├── 2.npy          # qweight (uint8)
-        │   ├── 2_qparams.json # scales, zeros, metadata
+        │   ├── 2_qparams.npz # scales, zeros, group_size, shape (binary)
         │   ├── 3.npy
-        │   ├── 3_qparams.json
+        │   ├── 3_qparams.npz
         │   └── ...
         ├── error_db.json      # Per-layer relative error per bitwidth
         ├── baseline_*.npz     # Top-K baseline cache
