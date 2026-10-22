@@ -2,6 +2,12 @@
 
 Port of [IST-DASLab SLQ](https://github.com/IST-DASLab/SLQ) (COLM 2026) to MLX for Apple Silicon.
 
+## 🤗 Pre-quantized Model on Hugging Face
+
+**Qwen3-1.7B-MLX-slq-4.5bpw** — Non-uniform SLQ quantization (4.49 bpw avg, EAR 0.9918)
+- [hermitdave/Qwen3-1.7B-MLX-slq-4.5bpw](https://huggingface.co/hermitdave/Qwen3-1.7B-MLX-slq-4.5bpw)
+- Load with: `mlx_lm.load("hermitdave/Qwen3-1.7B-MLX-slq-4.5bpw")`
+
 ## Results (Qwen3-1.7B)
 
 | Metric | Target | Achieved |
