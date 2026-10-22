@@ -61,63 +61,78 @@ def solve_allocation_heuristic(
     bitwidth_map: Optional[Dict[int, float]] = None,
     layer_groups: Optional[List[LayerGroup]] = None,
 ) -> Dict[str, int]:
-    """Simple greedy allocation: start all at max bitwidth, reduce layers with lowest error impact first."""
+    """Greedy bitwidth allocation.
+
+    Start every layer at the maximum bitwidth, then repeatedly take the cheapest
+    one-rung reduction until the parameter-weighted average reaches the target.
+
+    A rung is a single step down the available bitwidths, so a layer can travel
+    8 -> 7 -> 5 -> 3 across successive steps. The previous version only considered
+    one jump from max_bw and refused to touch a layer twice, so with more than two
+    bitwidths it always picked the shallowest jump (8 -> 7) and returned 100%
+    7-bit for a 4.5 bpw target. Layers in the same group move together.
+    """
     bitwidth_map = bitwidth_map or {}
     groups = layer_groups or [LayerGroup(i, [n], n) for i, n in enumerate(error_db.layer_names)]
-
-    # Cost = relative error for each layer at each bitwidth
     costs = layer_costs(error_db)
+    param_counts = error_db.param_counts
 
-    # Start all at max bitwidth
-    max_bw = max(available_bw)
-    config = {n: max_bw for n in error_db.layer_names}
+    ordered = sorted(available_bw)
+    max_bw = ordered[-1]
+    next_lower = {ordered[i]: ordered[i - 1] for i in range(1, len(ordered))}
 
-    # Compute current average bitwidth
-    def avg_bw(cfg):
-        params = [error_db.param_counts.get(n, 1) for n in cfg]
-        total = sum(params)
-        bits = sum(get_actual_bitwidth(cfg[n], bitwidth_map) * error_db.param_counts.get(n, 1) for n in cfg)
+    def avg_bw(cfg: Dict[str, int]) -> float:
+        total = sum(param_counts.get(n, 1) for n in cfg)
+        bits = sum(
+            get_actual_bitwidth(cfg[n], bitwidth_map) * param_counts.get(n, 1)
+            for n in cfg
+        )
         return bits / total if total else 0.0
 
-    current_avg = avg_bw(config)
+    config = {n: max_bw for n in error_db.layer_names}
+    group_bw = {g.group_id: max_bw for g in groups}
 
-    # If already under target, return
-    if current_avg <= target_bitwidth:
-        return config
-
-    # Greedy: sort layer-group options by error increase per bit saved
-    # For each group, compute the error increase per bit saved for each possible reduction
-    options = []
-    for i, group in enumerate(groups):
-        for bw in sorted(available_bw, reverse=True):
-            if bw == max_bw:
+    steps = 0
+    while avg_bw(config) > target_bitwidth:
+        best = None  # (marginal cost per bit saved, group, next bitwidth)
+        for group in groups:
+            cur = group_bw[group.group_id]
+            nxt = next_lower.get(cur)
+            if nxt is None:
                 continue
-            # Error increase for this group going from max_bw to bw
-            err_increase = sum(
-                costs.get(n, {}).get(bw, float('inf')) - costs.get(n, {}).get(max_bw, 0.0)
-                for n in group.layer_names
-            )
-            # Bits saved
-            params = sum(error_db.param_counts.get(n, 1) for n in group.layer_names)
-            bits_saved = (get_actual_bitwidth(max_bw, bitwidth_map) - get_actual_bitwidth(bw, bitwidth_map)) * params
-            if bits_saved > 0:
-                options.append((err_increase / bits_saved, i, bw, err_increase, bits_saved))
-
-    # Sort by error increase per bit saved (ascending = best first)
-    options.sort(key=lambda x: x[0])
-
-    # Apply reductions until target met
-    current_avg = avg_bw(config)
-    for err_per_bit, group_idx, bw, err_inc, bits_saved in options:
-        if current_avg <= target_bitwidth:
-            break
-        group = groups[group_idx]
-        if all(config[n] == max_bw for n in group.layer_names):
+            d_err = 0.0
+            d_bits = 0.0
             for n in group.layer_names:
-                config[n] = bw
-            current_avg = avg_bw(config)
-            logger.info(f"Reduced group {group_idx} ({len(group.layer_names)} layers) to {bw}-bit, avg={current_avg:.4f}")
+                e_cur = costs.get(n, {}).get(cur)
+                e_next = costs.get(n, {}).get(nxt)
+                if e_cur is None or e_next is None:
+                    continue
+                p = param_counts.get(n, 1)
+                d_err += e_next - e_cur
+                d_bits += (get_actual_bitwidth(cur, bitwidth_map)
+                           - get_actual_bitwidth(nxt, bitwidth_map)) * p
+            if d_bits <= 0:
+                continue
+            marginal = d_err / d_bits
+            if best is None or marginal < best[0]:
+                best = (marginal, group, nxt)
 
+        if best is None:
+            logger.warning(
+                f"Target {target_bitwidth} unreachable: every layer is already at "
+                f"the minimum bitwidth, average is {avg_bw(config):.4f}"
+            )
+            break
+
+        _, group, nxt = best
+        group_bw[group.group_id] = nxt
+        for n in group.layer_names:
+            config[n] = nxt
+        steps += 1
+        if steps % 100 == 0 or avg_bw(config) <= target_bitwidth:
+            logger.info(f"  step {steps}: average bitwidth {avg_bw(config):.4f}")
+
+    logger.info(f"Allocation converged in {steps} greedy steps")
     return config
 
 
