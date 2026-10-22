@@ -1,0 +1,14 @@
+# SLQ-MLX Requirements
+mlx>=0.24.0
+mlx-lm>=0.20.0
+numpy>=1.24
+tqdm>=4.66
+safetensors>=0.4
+huggingface-hub>=0.20
+datasets>=2.16
+transformers>=4.36
+pulp>=2.7  # ILP solver (pure Python, uses CBC)
+scipy>=1.11  # For potential future use
+
+# Optional: for lm-eval integration (Task-Lossless search)
+# lm-eval>=0.4.3

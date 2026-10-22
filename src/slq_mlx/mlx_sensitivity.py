@@ -1,0 +1,379 @@
+"""Sensitivity estimation for SLQ: Linear alphas + Shapley values.
+
+Ported from SLQ src/sensitivity/database.py and slq_build_database.py
+"""
+
+import hashlib
+import json
+import logging
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union
+import numpy as np
+import mlx.core as mx
+import mlx.nn as nn
+
+from .mlx_metrics import compute_all_metrics, compute_baseline_topk
+from .mlx_model_utils import get_layer_weights, set_layer_weights
+from .mlx_weight_store import ErrorDatabase, LayerGroup, WeightStore, compute_layer_error
+from .mlx_data import prepare_calibration_data
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class LinearSensitivityData:
+    """Per-layer linear alphas: cost = alpha * relative weight error."""
+    nll_alphas: Dict[str, float] = field(default_factory=dict)
+    kl_alphas: Dict[str, float] = field(default_factory=dict)
+    ear_alphas: Dict[str, float] = field(default_factory=dict)
+    layer_names: List[str] = field(default_factory=list)
+    top_k: int = 10
+    calibration_dataset: str = ""
+    calibration_samples: int = 0
+    num_noise_samples: int = 15
+    seed: int = 0
+    per_layer_normalized: bool = True
+    layer_groups: Optional[List[Dict]] = None
+
+
+@dataclass
+class ShapleySensitivityData:
+    """Multi-bitwidth Shapley values per player and per layer."""
+    nll_shapley_values: Optional[np.ndarray] = None
+    kl_shapley_values: Optional[np.ndarray] = None
+    ear_shapley_values: Optional[np.ndarray] = None
+    nll_shapley_per_level: Optional[Dict[str, Dict[int, float]]] = None
+    kl_shapley_per_level: Optional[Dict[str, Dict[int, float]]] = None
+    ear_shapley_per_level: Optional[Dict[str, Dict[int, float]]] = None
+    layer_names: List[str] = field(default_factory=list)
+    bitwidths: List[int] = field(default_factory=list)
+    top_k: int = 10
+    calibration_dataset: str = ""
+    calibration_samples: int = 0
+    num_permutations: int = 50
+    seed: int = 0
+    per_layer_normalized: bool = True
+    layer_groups: Optional[List[Dict]] = None
+
+
+class GPUWeightCache:
+    """In-memory weight cache for fast Shapley permutation swapping.
+
+    On MLX unified memory, this is just a dict of pre-loaded weights.
+    """
+
+    def __init__(self, model: nn.Module, weight_store: WeightStore, bitwidths: List[int], preload: bool = True):
+        self.model = model
+        self.weight_store = weight_store
+        self.bitwidths = bitwidths
+        self.max_bw = max(bitwidths)
+        self.cached_weights: Dict[Tuple[str, int], mx.array] = {}
+        self.current_bw: Dict[str, int] = {}
+        self.original_weights: Dict[str, mx.array] = {}
+
+        # Store original weights
+        for name in weight_store.get_layer_names():
+            layer = model.get_submodule(name)
+            self.original_weights[name] = layer.weight.copy()
+
+        if preload:
+            self._preload_all()
+
+    def _preload_all(self):
+        """Preload all quantized weights for all layers and bitwidths."""
+        logger.info("Preloading weights for Shapley estimation...")
+        for name in self.weight_store.get_layer_names():
+            for bw in self.bitwidths:
+                self.cached_weights[(name, bw)] = self.weight_store.get_layer_weight(name, bw)
+        mx.eval([w for w in self.cached_weights.values()])
+
+    def swap_all_layers(self, model: nn.Module, target_bw: Dict[str, int]):
+        """Swap all layers to target bitwidths."""
+        for name, bw in target_bw.items():
+            self.swap_layer(model, name, bw)
+
+    def swap_layer(self, model: nn.Module, name: str, bitwidth: int):
+        """Swap a single layer to target bitwidth."""
+        weight = self.cached_weights.get((name, bitwidth))
+        if weight is None:
+            weight = self.weight_store.get_layer_weight(name, bitwidth)
+            self.cached_weights[(name, bitwidth)] = weight
+        set_layer_weights(model, name, weight)
+        self.current_bw[name] = bitwidth
+        mx.eval(weight)  # Materialize
+
+
+def build_error_database(model: nn.Module, weight_store: WeightStore) -> ErrorDatabase:
+    """Compute relative weight error of every quantized layer vs original."""
+    error_db = ErrorDatabase()
+    for name in weight_store.get_layer_names():
+        original = get_layer_weights(model, name)
+        if original is None:
+            continue
+        error_db.param_counts[name] = original.size
+        for bw in weight_store.get_available_bitwidths(name):
+            quantized = weight_store.get_layer_weight(name, bw)
+            error = compute_layer_error(original, quantized)
+            error_db.add_layer_option(name, bw, error)
+    return error_db
+
+
+def estimate_linear_alphas(
+    model: nn.Module,
+    original_weights: Dict[str, mx.array],
+    groups: List[LayerGroup],
+    metric_fn,
+    num_samples: int = 15,
+) -> Tuple[Dict[str, float], Dict[str, float], Dict[str, float]]:
+    """Per-layer linear alphas: mean of metric degradation / t^2 over Gaussian noise levels t."""
+    t_levels = np.linspace(0.01, 0.3, num_samples)
+
+    nll_base, kl_base, ear_base = metric_fn()
+
+    nll_deltas = {name: [] for name in original_weights}
+    kl_deltas = {name: [] for name in original_weights}
+    ear_deltas = {name: [] for name in original_weights}
+
+    for group in groups:
+        for t in t_levels:
+            # Add noise to all layers in group
+            for name in group.layer_names:
+                orig = original_weights[name]
+                noise = mx.random.normal(orig.shape) * orig.std() * t
+                set_layer_weights(model, name, orig + noise)
+
+            nll, kl, ear = metric_fn()
+
+            for name in group.layer_names:
+                nll_deltas[name].append(nll - nll_base)
+                kl_deltas[name].append(kl - kl_base)
+                ear_deltas[name].append(ear_base - ear)  # EAR loss
+
+            # Restore
+            for name in group.layer_names:
+                set_layer_weights(model, name, original_weights[name])
+
+    # Compute alphas: mean(delta / t^2) per layer
+    nll_alphas, kl_alphas, ear_alphas = {}, {}, {}
+    for group in groups:
+        for name in group.layer_names:
+            nll_alpha = np.mean(np.array(nll_deltas[name]) / t_levels**2).clip(min=0)
+            kl_alpha = np.mean(np.array(kl_deltas[name]) / t_levels**2).clip(min=0)
+            ear_alpha = np.mean(np.array(ear_deltas[name]) / t_levels**2).clip(min=0)
+
+            # Normalize by group size (Eqs 5-6)
+            nll_alpha /= len(group.layer_names)
+            kl_alpha /= len(group.layer_names)
+            ear_alpha /= len(group.layer_names)
+
+            nll_alphas[name] = float(nll_alpha)
+            kl_alphas[name] = float(kl_alpha)
+            ear_alphas[name] = float(ear_alpha)
+
+    return nll_alphas, kl_alphas, ear_alphas
+
+
+def estimate_shapley_values(
+    model: nn.Module,
+    gpu_cache: GPUWeightCache,
+    groups: List[LayerGroup],
+    bitwidths: List[int],
+    metric_fn,
+    num_permutations: int = 50,
+) -> np.ndarray:
+    """Algorithm 1: Shapley values for [NLL, KL, EAR] x groups x bitwidths."""
+    max_bw = max(bitwidths)
+    shapley = np.zeros((3, len(groups), len(bitwidths)))
+    sign = np.array([1.0, 1.0, -1.0])  # NLL, KL increase; EAR decreases
+
+    for level_idx, target_bw in enumerate(bitwidths):
+        if target_bw == max_bw:
+            continue
+
+        for _ in range(num_permutations):
+            perm = np.random.permutation(len(groups))
+
+            # Start with all layers at max_bw
+            gpu_cache.swap_all_layers(model, {n: max_bw for g in groups for n in g.layer_names})
+            prev = np.array(metric_fn())
+
+            for g_idx in perm:
+                for name in groups[g_idx].layer_names:
+                    gpu_cache.swap_layer(model, name, target_bw)
+
+                cur = np.array(metric_fn())
+                shapley[:, g_idx, level_idx] += sign * (cur - prev) / num_permutations
+                prev = cur
+
+            mx.eval(mx.zeros(1))  # Clear cache
+
+    return shapley
+
+
+def per_layer_values(values: np.ndarray, groups: List[LayerGroup], bitwidths: List[int]) -> Dict[str, Dict[int, float]]:
+    """Each layer stores phi_group / |group| so summing over group counts once."""
+    return {
+        name: {bw: float(values[i, j]) / len(g.layer_names) for j, bw in enumerate(bitwidths)}
+        for i, g in enumerate(groups)
+        for name in g.layer_names
+    }
+
+
+def save_json(data, filepath: Path):
+    """Save dataclass as JSON."""
+    d = asdict(data)
+    # Convert numpy arrays to lists
+    for k, v in d.items():
+        if isinstance(v, np.ndarray):
+            d[k] = v.tolist()
+    with open(filepath, "w") as f:
+        json.dump(d, f, indent=2)
+    logger.info(f"Saved {filepath}")
+
+
+def parse_group_spec(spec: str) -> List[List[str]]:
+    """Parse layer group specification string.
+
+    Format: "pattern1,pattern2 pattern3,pattern4" (space-separated groups, comma-separated patterns)
+    """
+    if not spec.strip():
+        return []
+    groups = []
+    for group_str in spec.split():
+        patterns = [p.strip() for p in group_str.split(",")]
+        groups.append(patterns)
+    return groups
+
+
+def build_layer_groups(layer_names: List[str], group_patterns: List[List[str]]) -> List[LayerGroup]:
+    """Build layer groups from patterns."""
+    import re
+    groups = []
+    for group_id, patterns in enumerate(group_patterns):
+        layer_list = []
+        for name in layer_names:
+            for pattern in patterns:
+                if re.search(pattern, name):
+                    layer_list.append(name)
+                    break
+        if layer_list:
+            groups.append(LayerGroup(group_id, layer_list, " ".join(patterns)))
+    return groups
+
+
+def run_build_database(
+    model_id: str,
+    layer_dir: str,
+    calibration_data: str = "fineweb_edu",
+    calibration_samples: int = 512,
+    calibration_seq_len: int = 2048,
+    batch_size: int = 4,
+    top_k: int = 10,
+    seed: int = 42,
+    num_noise_samples: int = 15,
+    skip_linear: bool = False,
+    shapley_bitwidths: str = "2,3,4,5,6,7,8",
+    num_permutations: int = 50,
+    layer_groups: str = "mlp.gate_proj,mlp.up_proj self_attn.k_proj,self_attn.q_proj,self_attn.v_proj",
+    force_recompute: bool = False,
+) -> Tuple[str, str]:
+    """Run sensitivity database building.
+
+    Returns paths to (linear_db_path, shapley_db_path).
+    """
+    mx.random.seed(seed)
+    np.random.seed(seed)
+
+    layer_dir = Path(layer_dir)
+    use_grouping = bool(layer_groups.strip())
+    group_suffix = f"_grp{hashlib.md5(layer_groups.encode()).hexdigest()[:8]}" if use_grouping else ""
+    tag = f"topk{top_k}_{calibration_data}_{calibration_samples}x{calibration_seq_len}"
+    bitwidths = sorted(int(b) for b in shapley_bitwidths.split(","))
+
+    error_db_path = layer_dir / "error_db.json"
+    baseline_path = layer_dir / f"baseline_{tag}_seed{seed}.npz"
+    linear_path = layer_dir / f"linear_{tag}_{num_noise_samples}noise{group_suffix}_seed{seed}.json"
+    shapley_path = layer_dir / f"shapley_{tag}_{num_permutations}perms_bw{'-'.join(map(str, bitwidths))}{group_suffix}_seed{seed}.json"
+
+    weight_store = WeightStore(str(layer_dir)).load()
+    model = load_model(model_id)  # Need to implement
+    tokenizer = get_tokenizer(model_id)
+
+    # Prepare calibration data
+    input_ids, masks = prepare_calibration_data(model_id, calibration_data, calibration_samples, calibration_seq_len, seed)
+
+    # Error database
+    if error_db_path.exists() and not force_recompute:
+        error_db = ErrorDatabase.load(str(error_db_path))
+    else:
+        error_db = build_error_database(model, weight_store)
+        error_db.save(str(error_db_path))
+
+    # Baseline top-K
+    if baseline_path.exists() and not force_recompute:
+        baseline = np.load(baseline_path)
+        topk_vals, topk_idx = baseline["topk_vals"], baseline["topk_idx"]
+    else:
+        topk_vals, topk_idx = compute_baseline_topk(model, input_ids, batch_size, top_k)
+        np.savez(str(baseline_path), topk_vals=np.array(topk_vals), topk_idx=np.array(topk_idx))
+
+    def metric_fn():
+        return compute_all_metrics(model, input_ids, topk_vals, topk_idx, batch_size, masks)
+
+    group_patterns = parse_group_spec(layer_groups) if use_grouping else []
+    groups = build_layer_groups(error_db.layer_names, group_patterns)
+    logger.info(f"{len(error_db.layer_names)} layers in {len(groups)} groups")
+
+    meta = dict(
+        layer_names=error_db.layer_names,
+        top_k=top_k,
+        calibration_dataset=calibration_data,
+        calibration_samples=calibration_samples,
+        seed=seed,
+        per_layer_normalized=True,
+        layer_groups=[asdict(g) for g in groups] if use_grouping else None,
+    )
+
+    # Linear alphas
+    if not skip_linear and (force_recompute or not linear_path.exists()):
+        original_weights = {n: get_layer_weights(model, n).copy() for n in error_db.layer_names}
+        nll_a, kl_a, ear_a = estimate_linear_alphas(model, original_weights, groups, metric_fn, num_noise_samples)
+        save_json(LinearSensitivityData(
+            nll_alphas=nll_a, kl_alphas=kl_a, ear_alphas=ear_a,
+            num_noise_samples=num_noise_samples, **meta
+        ), linear_path)
+
+    # Shapley values
+    if force_recompute or not shapley_path.exists():
+        gpu_cache = GPUWeightCache(model, weight_store, bitwidths, preload=True)
+        nll_s, kl_s, ear_s = estimate_shapley_values(model, gpu_cache, groups, bitwidths, metric_fn, num_permutations)
+        save_json(ShapleySensitivityData(
+            nll_shapley_values=nll_s, kl_shapley_values=kl_s, ear_shapley_values=ear_s,
+            nll_shapley_per_level=per_layer_values(nll_s, groups, bitwidths),
+            kl_shapley_per_level=per_layer_values(kl_s, groups, bitwidths),
+            ear_shapley_per_level=per_layer_values(ear_s, groups, bitwidths),
+            bitwidths=bitwidths, num_permutations=num_permutations, **meta
+        ), shapley_path)
+
+    return str(linear_path), str(shapley_path)
+
+
+# Helper functions needed - import from appropriate modules
+def load_model(model_id: str) -> nn.Module:
+    """Load model for calibration."""
+    from mlx_lm import load
+    model, _ = load(model_id)
+    return model
+
+
+def get_tokenizer(model_id: str):
+    from .mlx_data import get_tokenizer
+    return get_tokenizer(model_id)
+
+def load_model(model_id: str) -> nn.Module:
+    """Load model for calibration."""
+    from mlx_lm import load
+    model, _ = load(model_id)
+    return model

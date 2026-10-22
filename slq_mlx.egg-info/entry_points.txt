@@ -1,0 +1,6 @@
+[console_scripts]
+slq-build-ckpt = scripts.run_build_ckpt:main
+slq-build-db = scripts.run_build_db:main
+slq-gptq = scripts.run_gptq:main
+slq-search-dl = scripts.run_search_dl:main
+slq-search-tl = scripts.run_search_tl:main
