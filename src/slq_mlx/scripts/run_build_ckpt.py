@@ -22,7 +22,7 @@ def main():
     parser.add_argument("--uniform", type=int, metavar="BITS", help="every layer at BITS")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--subdir-name")
-    parser.add_argument("--dtype", default="bfloat16", choices=["float16", "bfloat16", "float32"])
+    parser.add_argument("--dtype", default="float16", choices=["float16", "float32"])
     parser.add_argument("--group-size", type=int, default=128)
     parser.add_argument("--force", action="store_true")
 
