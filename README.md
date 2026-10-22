@@ -8,6 +8,34 @@ Port of [IST-DASLab SLQ](https://github.com/IST-DASLab/SLQ) (COLM 2026) to MLX f
 - [hermitdave/Qwen3-1.7B-MLX-slq-4.5bpw](https://huggingface.co/hermitdave/Qwen3-1.7B-MLX-slq-4.5bpw)
 - Load with: `mlx_lm.load("hermitdave/Qwen3-1.7B-MLX-slq-4.5bpw")`
 
+## ⚠️ Model Support: Dense Models Only
+
+**SLQ-MLX supports dense (non-MoE) transformer models only.** Mixture-of-Experts models are explicitly out of scope and untested.
+
+### Why
+
+The upstream SLQ method itself was evaluated on **dense models only**:
+
+| Source | Finding |
+|--------|---------|
+| [SLQ paper (arXiv 2605.02404v1)](https://arxiv.org/abs/2605.02404) | Evaluates 4 dense models — Qwen3-8B, Qwen3-32B, Qwen3.5-27B, Llama-3.3-70B-Instruct. **Zero occurrences of "MoE", "expert", "mixture", or "router" in the full text.** |
+| [IST-DASLab/SLQ repo](https://github.com/IST-DASLab/SLQ) | No MoE/expert-specific files, configs, or scripts |
+
+Three concrete blockers if you tried to force a MoE model through:
+
+1. **Expert naming.** The upstream layer regex is `.*layers.*((q|k|v|o|gate|up|down)_proj)$`. This matches Qwen-style experts (which reuse `gate_proj`/`up_proj`/`down_proj`) but **misses Mixtral-style experts** (`w1`/`w2`/`w3`).
+2. **Allocation granularity.** Upstream `src/models/grouping.py` keys groups on `(block_index, pattern_index)`, so **all experts in a block collapse into one group and share a single bitwidth** — no per-expert allocation.
+3. **Group size divisibility.** Group size 128 requires `in_features % 128 == 0`; expert intermediate dimensions frequently violate this.
+
+> **Note:** the upstream README references a "Table 6 (MoE)", but in arXiv v1 that table is token-divergence analysis, not MoE. Worth clarifying with the authors.
+
+### Support matrix
+
+| Model type | Supported | Notes |
+|------------|-----------|-------|
+| Dense (Qwen3, Llama-3.x, …) | ✅ | Verified — Qwen3-1.7B at 4.49 bpw, EAR 0.9918 |
+| MoE (Mixtral, DeepSeek, Nemotron-H, Qwen MoE, …) | ❌ | Untested — see blockers above |
+
 ## Results (Qwen3-1.7B)
 
 | Metric | Target | Achieved |
@@ -29,6 +57,8 @@ SLQ finds the **lowest-bitwidth non-uniform weight quantization** that meets exp
 | **Distribution-Lossless (DL)** | Next-token distribution matches BF16 (EAR ≥ 0.99) | 5.0–6.6 bpw |
 
 This MLX port implements the full quantization pipeline **except mixed-bitwidth inference kernels** (Humming equivalent).
+
+**Scope:** dense decoder-only transformers only — see [Model Support: Dense Models Only](#️-model-support-dense-models-only) above.
 
 ## Pipeline
 
@@ -163,6 +193,17 @@ def mixed_gemm(x, qweights, scales, zeros, bitwidths):
     # Output: [batch, seq, d_out] per layer
     pass
 ```
+
+### MoE Support (not currently available)
+
+MoE is out of scope for this port. Making it work would require:
+
+1. **Per-expert layer selection** — a `--quantizable-modules` regex that matches the target MoE naming scheme (Qwen-style `gate_proj`/`up_proj`/`down_proj` works; Mixtral-style `w1`/`w2`/`w3` does not).
+2. **Per-expert grouping** — upstream `build_layer_groups` keys on `(block_index, pattern_index)`, collapsing all experts in a block into one bitwidth. Per-expert allocation needs the group key extended to include the expert index.
+3. **Group-size validation** — verify `in_features % 128 == 0` for every expert intermediate dimension before quantizing.
+4. **Router exclusion** — the MoE router/gate should be kept at BF16 and excluded from the regex.
+
+Untested. Contributions welcome, but expect the allocation-quality picture to differ from dense models since per-expert sensitivity is the main lever MoE has.
 
 ## License
 
