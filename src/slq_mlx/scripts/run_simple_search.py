@@ -159,12 +159,16 @@ def apply_config(model: nn.Module, config: Dict[str, int], weight_store: WeightS
         set_submodule(model, name, qlayer)
 
 
-def load_calibration(model_id: str, n_samples: int, seq_len: int, seed: int) -> mx.array:
-    """Load simple calibration data."""
-    tokenizer = get_tokenizer(model_id)
-    sequences = get_simple_calibration(n_samples * seq_len, seq_len, tokenizer)
-    sequences = sequences[:n_samples]
-    return mx.stack(sequences)
+def load_calibration(model_id: str, n_samples: int, seq_len: int, seed: int,
+                     dataset: str = "fineweb_edu") -> mx.array:
+    """Load calibration data for validation.
+
+    Must use the same corpus as quantization -- validating on the synthetic
+    fallback while calibrating on FineWeb-Edu reports an EAR that has nothing
+    to do with the shipped model.
+    """
+    input_ids, _ = prepare_calibration_data(model_id, dataset, n_samples, seq_len, seed)
+    return input_ids
 
 
 def main():
@@ -174,6 +178,9 @@ def main():
     parser.add_argument("--target-bits", type=float, required=True, help="Target average bits per parameter")
     parser.add_argument("--bitwidths", default="2,3,4,5,6,7,8")
     parser.add_argument("--bitwidth-map", default="")
+    parser.add_argument("--calibration-data", default="fineweb_edu",
+                        choices=["fineweb_edu", "wikitext2", "c4"],
+                        help="Must match the corpus used for quantization")
     parser.add_argument("--calibration-samples", type=int, default=32)
     parser.add_argument("--calibration-seq-length", type=int, default=1024)
     parser.add_argument("--seed", type=int, default=42)
@@ -213,7 +220,9 @@ def main():
 
     # Validate with calibration data
     tokenizer = get_tokenizer(args.model)
-    cal_data = load_calibration(args.model, args.calibration_samples, args.calibration_seq_length, args.seed)
+    cal_data = load_calibration(args.model, args.calibration_samples,
+                                args.calibration_seq_length, args.seed,
+                                args.calibration_data)
     topk_vals, topk_idx = compute_baseline_topk(model, cal_data, 4, 10)
     
     apply_config(model, config, weight_store, available_bw)
