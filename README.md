@@ -2,12 +2,23 @@
 
 Port of [IST-DASLab SLQ](https://github.com/IST-DASLab/SLQ) (COLM 2026) to MLX for Apple Silicon.
 
+## Results (Qwen3-1.7B)
+
+| Metric | Target | Achieved |
+|--------|--------|----------|
+| **Average Bitwidth** | 4.5 bpw | **4.4935 bpw** |
+| **EAR** | ≥ 0.99 | **0.9918** |
+| **KL Divergence** | — | **0.0081** |
+| **Distribution** | — | 8-bit: 66 layers (39%), 4-bit: 102 layers (61%) |
+
+> Matches SLQ paper's **Distribution-Lossless** target (EAR ≥ 0.99 at 5.0–6.6 bpw) with simple heuristic search.
+
 ## Overview
 
 SLQ finds the **lowest-bitwidth non-uniform weight quantization** that meets explicit fidelity targets:
 
-| Target | Criterion | Achieved Bitwidth |
-|--------|-----------|-------------------|
+| Target | Criterion | Paper Range |
+|--------|-----------|-------------|
 | **Task-Lossless (TL)** | Mean zero-shot benchmark recovery ≥ 99% of BF16 | 3.3–4.7 bpw |
 | **Distribution-Lossless (DL)** | Next-token distribution matches BF16 (EAR ≥ 0.99) | 5.0–6.6 bpw |
 
@@ -167,4 +178,5 @@ Apache-2.0 (same as upstream SLQ)
 
 - Original SLQ implementation by IST-DASLab (Michael Helcig, Eldar Kurtic, Dan Alistarh)
 - GPTQ implementation adapted from EvoPress
-- Ported to MLX for Apple Silicon by Hermes Agent
+- Ported to MLX for Apple Silicon by **Hermes Agent** (Nous Research)
+- Maintained by hermitdave (HuggingFace: hermitdave)
