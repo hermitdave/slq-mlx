@@ -183,8 +183,7 @@ class MLXQuantizer:
         quantized = handle.quantize()
 
         for bits, (qweight, scales, zeros) in quantized.items():
-            # Save qweight as numpy
-            mx.save(os.path.join(layer_save_dir, f"{bits}.npy"), qweight)
+            # Writes {bits}.npy (uint8 qweight) and {bits}_qparams.npz (binary)
             save_qparams(layer_save_dir, bits, qweight, scales, zeros, handle)
 
             # If this is the calibration bitwidth, replace layer in model for next block calibration
