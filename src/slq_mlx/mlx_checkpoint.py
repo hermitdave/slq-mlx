@@ -1,5 +1,14 @@
 """Build MLX checkpoint from SLQ bitwidth config.
 
+DEPRECATED as the default export path. This writes fake-quantized float16
+weights, which is always BF16-sized regardless of the SLQ bitwidth.
+
+Use ``slq_mlx.scripts.run_pack_mlx`` instead -- it stores the integer grid
+packed and runs it through MLX's fused ``mx.quantized_matmul``, so the model
+actually honours the SLQ bitwidth (2.29x smaller than BF16 on Qwen3-1.7B).
+``slq_mlx.scripts.run_build_ckpt`` now defaults to the packed exporter and only
+reaches this module via its ``--dequantized`` flag.
+
 Ported from SLQ slq_build_checkpoint.py
 """
 
