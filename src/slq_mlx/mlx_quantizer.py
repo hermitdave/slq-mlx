@@ -149,22 +149,29 @@ class MLXQuantizer:
                 full_name = f"{self.block_modules}.{block_id}.{name}"
                 self._quantize_layer(full_name, handle, calibration_bitwidth)
 
-            # Recompute inputs for next block using quantized weights
+            # Recompute inputs for next block using quantized weights.
+            #
+            # Both lists must stay the same length: quantize_block() zips them,
+            # and this model passes every block argument positionally, so the
+            # old code appended to input_args but never to input_kwargs. Block 1
+            # then zipped 3 arg-sets against 0 kwarg-dicts, ran no forward pass,
+            # and every layer from block 1 on silently fell back to RTN.
             new_input_args, new_input_kwargs = [], []
             for inp_args, inp_kwargs in zip(input_args, input_kwargs):
                 out = block(*inp_args, **inp_kwargs)
                 out = out[0] if isinstance(out, (tuple, list)) else out
 
-                if len(inp_args) > 0:
-                    new_inp_args = list(inp_args)
-                    new_inp_args[0] = out
-                    new_input_args.append(tuple(new_inp_args))
-                elif "hidden_states" in inp_kwargs:
-                    new_inp_kwargs = dict(inp_kwargs)
-                    new_inp_kwargs["hidden_states"] = out
-                    new_input_kwargs.append(new_inp_kwargs)
+                new_args = list(inp_args)
+                new_kwargs = dict(inp_kwargs)
+                if new_args:
+                    new_args[0] = out
+                elif "hidden_states" in new_kwargs:
+                    new_kwargs["hidden_states"] = out
                 else:
                     raise ValueError("Unsupported block input format")
+
+                new_input_args.append(tuple(new_args))
+                new_input_kwargs.append(new_kwargs)
 
             input_args, input_kwargs = new_input_args, new_input_kwargs
 
