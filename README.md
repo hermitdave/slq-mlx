@@ -389,4 +389,4 @@ Apache-2.0 (same as upstream SLQ)
 - Original SLQ implementation by IST-DASLab (Michael Helcig, Eldar Kurtic, Dan Alistarh)
 - GPTQ implementation adapted from EvoPress
 - Ported to MLX for Apple Silicon by **Hermes Agent** (Nous Research)
-- Maintained by hermitdave (HuggingFace: hermitdave)
+- Maintained by hermitdave (HuggingFace: hermitdave)# permission probe
