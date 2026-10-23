@@ -324,12 +324,23 @@ def run_build_database(
     skip_linear: bool = False,
     shapley_bitwidths: str = "2,3,4,5,6,7,8",
     num_permutations: int = 50,
-    layer_groups: str = "mlp.gate_proj,mlp.up_proj,mlp.down_proj self_attn.k_proj,self_attn.q_proj,self_attn.v_proj,self_attn.o_proj",
+    layer_groups: str = "",
     force_recompute: bool = False,
 ) -> Tuple[str, str]:
     """Run sensitivity database building.
 
     Returns paths to (linear_db_path, shapley_db_path).
+
+    ``layer_groups=""`` means per-layer: every layer becomes its own group, so
+    the allocation is genuinely per-layer. This is the MLX-appropriate default
+    because MLX does not fuse SwiGLU or QKV -- the upstream grouping exists only
+    so vLLM can serve fused projections at a shared bitwidth.
+
+    Per-layer sensitivity estimation is expensive, though: cost scales as
+    ``len(groups) * num_levels`` metric calls for linear and
+    ``len(bitwidths) * num_perms * (1 + len(groups))`` for Shapley. At 196
+    layers that is ~9 h (linear) and ~172 h (Shapley) at 10.5 s per call, so
+    ``run_build_db.py`` refuses per-layer sensitivity unless explicitly allowed.
     """
     mx.random.seed(seed)
     np.random.seed(seed)
@@ -371,7 +382,14 @@ def run_build_database(
         return compute_all_metrics(model, input_ids, topk_vals, topk_idx, batch_size, masks)
 
     group_patterns = parse_group_spec(layer_groups) if use_grouping else []
-    groups = build_layer_groups(error_db.layer_names, group_patterns)
+    if use_grouping:
+        groups = build_layer_groups(error_db.layer_names, group_patterns)
+    else:
+        # Per-layer: every layer is its own group, so the allocator is free to
+        # give each projection a different bitwidth. This is what MLX wants --
+        # MLX does not fuse SwiGLU or QKV, so the upstream grouping (a vLLM
+        # serving constraint) would only cost quality here.
+        groups = [LayerGroup(i, [n], n) for i, n in enumerate(error_db.layer_names)]
     logger.info(f"{len(error_db.layer_names)} layers in {len(groups)} groups")
 
     meta = dict(

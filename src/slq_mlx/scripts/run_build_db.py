@@ -30,12 +30,32 @@ def main():
     parser.add_argument("--shapley-bitwidths", default="2,3,4,5,6,7,8")
     parser.add_argument("--num-permutations", type=int, default=50)
     parser.add_argument("--skip-shapley", action="store_true")
-    parser.add_argument("--layer-groups", default="mlp.gate_proj,mlp.up_proj,mlp.down_proj self_attn.k_proj,self_attn.q_proj,self_attn.v_proj,self_attn.o_proj",
+    parser.add_argument("--layer-groups", default="",
                         help="Groups of layers constrained to share a bitwidth (space-separated groups, "
-                             "comma-separated patterns).")
+                             "comma-separated patterns). Default empty = per-layer, which is correct for "
+                             "MLX: MLX does not fuse SwiGLU or QKV, so the upstream grouping only exists "
+                             "to keep vLLM's fused projections at a shared bitwidth. Pass the upstream "
+                             "spec to reproduce their numbers: "
+                             "'mlp.gate_proj,mlp.up_proj,mlp.down_proj "
+                             "self_attn.k_proj,self_attn.q_proj,self_attn.v_proj,self_attn.o_proj'")
+    parser.add_argument("--allow-per-layer-sensitivity", action="store_true",
+                        help="Estimate linear/Shapley sensitivity at per-layer granularity. Expensive: "
+                             "cost scales with the number of groups, so 196 layers is ~9 h (linear) and "
+                             "~172 h (Shapley) at 10.5 s per metric call. Only meaningful for small models.")
     parser.add_argument("--force-recompute", action="store_true")
 
     args = parser.parse_args()
+
+    if not args.layer_groups.strip() and not args.allow_per_layer_sensitivity:
+        if not args.skip_linear or not args.skip_shapley:
+            parser.error(
+                "per-layer sensitivity estimation is impractical at this scale "
+                "(~9 h linear, ~172 h Shapley for 196 layers). The heuristic "
+                "allocator (run_search_dl.py --method heuristic) needs only "
+                "error_db.json and is the default. Pass "
+                "--allow-per-layer-sensitivity to override, or set --layer-groups "
+                "to a coarse grouping."
+            )
 
     linear_path, shapley_path = run_build_database(
         model_id=args.model,

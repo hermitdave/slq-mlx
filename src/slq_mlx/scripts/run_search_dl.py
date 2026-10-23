@@ -19,7 +19,13 @@ def main():
     parser.add_argument("--model", required=True)
     parser.add_argument("--layer-dir", required=True)
     parser.add_argument("--mode", choices=["dl", "tl"], default="dl")
-    parser.add_argument("--sensitivity-method", choices=["shapley", "linear"], default="shapley")
+    parser.add_argument("--method", choices=["heuristic", "ilp"], default="heuristic",
+                        help="Allocator. 'heuristic' (default) is the per-layer greedy allocator "
+                             "over error_db.json -- cheap, needs no sensitivity DB, and measured "
+                             "better than the ILP at equal budget on MLX. 'ilp' is the multiple-choice "
+                             "knapsack over a sensitivity DB (--sensitivity-method).")
+    parser.add_argument("--sensitivity-method", choices=["shapley", "linear"], default="shapley",
+                        help="Only used with --method ilp.")
     parser.add_argument("--shapley-db")
     parser.add_argument("--linear-db")
     parser.add_argument("--kl-weight", type=float)
@@ -46,6 +52,7 @@ def main():
         "--model", args.model,
         "--layer-dir", args.layer_dir,
         "--mode", args.mode,
+        "--method", args.method,
         "--sensitivity-method", args.sensitivity_method,
     ]
 

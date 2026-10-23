@@ -41,13 +41,19 @@ Three concrete blockers if you tried to force a MoE model through:
 
 Full 2–8 sweep, all 28 blocks GPTQ-calibrated on 1,048,576 FineWeb-Edu tokens.
 
-| Metric | Target | Achieved |
-|--------|--------|----------|
-| **Average bitwidth** | 4.5 bpw | **4.4940 bpw** |
-| **Distribution** | — | 6-bit 28.6%, 5-bit 37.8%, 4-bit 33.7% |
-| **EAR** (FineWeb-Edu) | — | **0.9116** |
-| **KL divergence** (FineWeb-Edu) | — | **0.0522** |
-| **Artifact size** | — | **1.399 GiB** (BF16 base 3.205 GiB → 2.29×) |
+| Metric | Value |
+|--------|-------|
+| **Average bitwidth** (parameter-weighted) | **4.4940 bpw** |
+| **Distribution** | 6-bit 28.6%, 5-bit 37.8%, 4-bit 33.7% |
+| **EAR** (FineWeb-Edu) | **0.9116** |
+| **KL divergence** (FineWeb-Edu) | **0.0522** |
+| **Artifact size** | **1.399 GiB** (BF16 base 3.205 GiB → 2.29×) |
+
+Re-running the default heuristic path reproduces the same allocation (598 greedy steps, 6/5/4-bit split
+identical) and validates at EAR 0.9099 / KL 0.0514 — the small EAR delta versus 0.9116 is the
+validation path: `run_simple_search.py` measures through `QuantizedLinear` (integer grid) while the
+default `run_search_dl.py` path measures through the dequantized weight. Both are valid readings of the
+same allocation.
 
 > **EAR 0.91 at 4.5 bpw is consistent with the paper, not a defect.** SLQ's
 > Distribution-Lossless target (EAR ≥ 0.99) is defined at **5.0–6.6 bpw**;
@@ -95,9 +101,75 @@ scales/zeros add ~10%.
 ```
 ┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐    ┌──────────────────┐
 │  Stage 1: GPTQ  │───▶│ Stage 2: Build   │───▶│ Stage 3: Search │───▶│ Stage 4: Export  │
-│  All Bitwidths  │    │ Sensitivity DB   │    │ (ILP + Binary)  │    │ Packed Checkpoint│
+│  All Bitwidths  │    │ Sensitivity DB   │    │ heuristic/ILP   │    │ Packed Checkpoint│
 └─────────────────┘    └──────────────────┘    └─────────────────┘    └──────────────────┘
 ```
+
+### Which allocator to use
+
+**Default: `--method heuristic`** — per-layer greedy allocation over `error_db.json`. Cheap, needs no
+sensitivity database, and measured better than the ILP at equal budget on MLX.
+
+**Optional: `--method ilp`** — multiple-choice knapsack over a Shapley or linear sensitivity database.
+Requires stage 2. See the warning below: on MLX the ILP is normally *worse*, not better.
+
+### Why the ILP is not the default on MLX
+
+Upstream groups layers before running Shapley:
+
+```bash
+# vLLM fuses these, so they must share a bitwidth at serving time.
+LAYER_GROUPS='mlp.gate_proj,mlp.up_proj self_attn.k_proj,self_attn.q_proj,self_attn.v_proj'
+```
+
+That grouping exists because **vLLM fuses SwiGLU and QKV**, so those projections must share a bitwidth
+*at serving time*. **MLX does not fuse them**, so the constraint is spurious here and only costs quality.
+
+Measured on Qwen3-1.7B, FineWeb-Edu 32x1024, equal ~4.5 bpw budget:
+
+| Allocator | Choices | Avg bpw | EAR | KL |
+|---|---|---|---|---|
+| **Heuristic (default)** | 196 | 4.4940 | **0.9116** | **0.0522** |
+| ILP + Shapley (grouped) | 2 | 4.5000 | 0.9072 | 0.0544 |
+| ILP + linear (grouped) | 2 | 4.5000 | 0.9072 | 0.0544 |
+
+The ILP was verified correct — exhaustive enumeration of all 49 grouped combinations confirms it found
+the true optimum of its search space (21 of 49 feasible at 4.5 bpw). The solver is fine; the grouped
+search space is too small.
+
+`--disable-grouping` is a **no-op** and will not fix this: Shapley values are computed at group
+granularity, so the sensitivity DB holds only as many distinct cost profiles as there were groups
+(measured: 196 layers, **2 distinct cost tables**). Ungrouping cannot manufacture information the DB
+does not have.
+
+Per-layer sensitivity estimation is also **computationally infeasible** at this scale — cost scales with
+the number of groups:
+
+| Groups | Linear (~15 levels) | Shapley (50 perms) |
+|---|---|---|
+| 2 | ~6 min | ~2.6 h |
+| 196 | ~9 h | ~172 h |
+
+So the grouping is a *scaling necessity*, not merely a vLLM artifact. `run_build_db.py` refuses
+per-layer sensitivity by default and requires `--allow-per-layer-sensitivity` to override.
+
+### EAR ≥ 0.99 is not reachable on this corpus
+
+The paper claims distribution-lossless compression (EAR ≥ 0.99) at ~5-6 bpw. Measured on Qwen3-1.7B,
+FineWeb-Edu 32x1024, top-k 10, all layers uniform:
+
+| Config | KL | EAR |
+|---|---|---|
+| BF16 | 0.000000 | 1.000000 |
+| all-8-bit | 0.001004 | **0.986348** |
+| all-6-bit | 0.007244 | 0.966474 |
+| all-5-bit | 0.026197 | 0.934538 |
+| all-4-bit | 0.102166 | 0.871704 |
+
+**EAR 0.99 is not reachable even at 8-bit**, so a DL bisect to `--min-ear 0.99` walks to max bitwidth and
+reports `satisfies: False` — correctly. The EAR implementation is a line-for-line port of upstream
+`src/metrics/evaluation.py`, so the gap is not a metric bug. Always state the measured ceiling next to
+the paper's number rather than quietly retargeting `--min-ear`.
 
 ### Stage 1: GPTQ Quantization
 Run GPTQ at bitwidths {2,3,4,5,6,7,8} for all quantizable layers. Saves fake-quantized weights and quantization parameters per layer.
@@ -152,18 +224,32 @@ python scripts/run_gptq.py \
   --cal-bitwidth 4 \
   --save-dir ./quant
 
-# 2. Build sensitivity database
+# 2. Build the error database (built by run_build_db, or standalone below)
 python scripts/run_build_db.py \
   --model Qwen/Qwen3-8B \
-  --layer-dir ./quant/Qwen3-8B/4bit
+  --layer-dir ./quant/Qwen3-8B/4bit \
+  --skip-linear --skip-shapley          # error_db.json only
 
-# 3a. Distribution-Lossless search (EAR ≥ 0.99)
+# 3. DEFAULT: per-layer greedy heuristic allocation at a fixed budget
 python scripts/run_search_dl.py \
   --model Qwen/Qwen3-8B \
   --layer-dir ./quant/Qwen3-8B/4bit \
+  --target-bitwidth 4.5
+
+# 3b. OPTIONAL: Shapley sensitivity database, then the ILP allocator
+#     (needs the grouping flag -- see "Why the ILP is not the default on MLX")
+python scripts/run_build_db.py \
+  --model Qwen/Qwen3-8B \
+  --layer-dir ./quant/Qwen3-8B/4bit \
+  --layer-groups "mlp.gate_proj,mlp.up_proj,mlp.down_proj self_attn.k_proj,self_attn.q_proj,self_attn.v_proj,self_attn.o_proj"
+
+python scripts/run_search_dl.py \
+  --model Qwen/Qwen3-8B \
+  --layer-dir ./quant/Qwen3-8B/4bit \
+  --method ilp --sensitivity-method shapley \
   --min-ear 0.99
 
-# 3b. Task-Lossless search (placeholder - uses predicted constraints)
+# 3c. Task-Lossless search (placeholder - uses predicted constraints)
 python scripts/run_search_tl.py \
   --model Qwen/Qwen3-8B \
   --layer-dir ./quant/Qwen3-8B/4bit \
