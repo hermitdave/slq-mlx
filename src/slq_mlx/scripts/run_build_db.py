@@ -49,12 +49,14 @@ def main():
     if not args.layer_groups.strip() and not args.allow_per_layer_sensitivity:
         if not args.skip_linear or not args.skip_shapley:
             parser.error(
-                "per-layer sensitivity estimation is impractical at this scale "
-                "(~9 h linear, ~172 h Shapley for 196 layers). The heuristic "
-                "allocator (run_search_dl.py --method heuristic) needs only "
-                "error_db.json and is the default. Pass "
+                "per-layer sensitivity estimation is impractical at this scale: "
+                "cost scales with the number of groups, and per-layer means 196 "
+                "groups (~9 h linear, ~172 h Shapley at 10.5 s per metric call). "
+                "The heuristic allocator (run_search_dl.py --method heuristic) "
+                "needs only error_db.json and is the default. Pass "
                 "--allow-per-layer-sensitivity to override, or set --layer-groups "
-                "to a coarse grouping."
+                "to a coarse grouping. Note upstream's own default grouping is "
+                "per-block (112 groups here, ~99 h), not per-layer."
             )
 
     linear_path, shapley_path = run_build_database(

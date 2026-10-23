@@ -143,15 +143,26 @@ granularity, so the sensitivity DB holds only as many distinct cost profiles as 
 does not have.
 
 Per-layer sensitivity estimation is also **computationally infeasible** at this scale — cost scales with
-the number of groups:
+the number of groups, because Shapley walks every group in every permutation:
 
-| Groups | Linear (~15 levels) | Shapley (50 perms) |
-|---|---|---|
-| 2 | ~6 min | ~2.6 h |
-| 196 | ~9 h | ~172 h |
+| Grouping | Groups | Shapley calls @50 perms | Wall time @10.5 s |
+|---|---|---|---|
+| Global (2 pattern-sets, all blocks) | 2 | 900 | ~2.6 h |
+| **Per-block (upstream's default)** | **112** | **33,900** | **~99 h** |
+| Per-layer | 196 | 59,100 | ~172 h |
 
-So the grouping is a *scaling necessity*, not merely a vLLM artifact. `run_build_db.py` refuses
-per-layer sensitivity by default and requires `--allow-per-layer-sensitivity` to override.
+So the grouping is a *scaling necessity*, not merely a vLLM artifact — and **upstream's own default
+granularity is already ~99 h on a single M3 Max**. `run_build_db.py` refuses per-layer sensitivity by
+default and requires `--allow-per-layer-sensitivity` to override.
+
+### Porting note: grouping must be per-block
+
+Upstream `src/models/grouping.py` keys groups on `(block_index, pattern_group)` — "Per transformer
+block, layers matching the same pattern group form one group; the rest stay singletons." Grouping
+globally instead (one group per pattern-set across all 28 blocks) collapses the model into 2 groups and
+leaves the sensitivity DB with only 2 distinct cost profiles, which is what makes the ILP nearly
+helpless. With upstream's spec on Qwen3-1.7B the correct count is **112 groups** (2 fused + 2 singletons
+per block), not 2.
 
 ### EAR ≥ 0.99 is not reachable on this corpus
 

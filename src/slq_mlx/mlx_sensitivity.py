@@ -6,6 +6,7 @@ Ported from SLQ src/sensitivity/database.py and slq_build_database.py
 import hashlib
 import json
 import logging
+import re
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -295,20 +296,43 @@ def parse_group_spec(spec: str) -> List[List[str]]:
     return groups
 
 
+_BLOCK_RE = re.compile(r"layers\.(\d+)\.")
+
+
 def build_layer_groups(layer_names: List[str], group_patterns: List[List[str]]) -> List[LayerGroup]:
-    """Build layer groups from patterns."""
-    import re
-    groups = []
-    for group_id, patterns in enumerate(group_patterns):
-        layer_list = []
-        for name in layer_names:
-            for pattern in patterns:
-                if re.search(pattern, name):
-                    layer_list.append(name)
-                    break
-        if layer_list:
-            groups.append(LayerGroup(group_id, layer_list, " ".join(patterns)))
-    return groups
+    """Per-block grouping, matching upstream ``src/models/grouping.py``.
+
+    Layers matching the same pattern group *within one transformer block* form a
+    single group; anything matching no pattern stays a singleton. Grouping
+    globally (one group per pattern-set across all blocks) would collapse 28
+    blocks into one group and leave the sensitivity DB with only a couple of
+    distinct cost profiles -- the ILP then has almost nothing to work with.
+
+    Upstream's docstring is explicit that this exists for "vLLM-fused
+    projections": vLLM fuses SwiGLU (gate/up) and QKV (k/q/v), so those must
+    share a bitwidth at serving time. MLX does not fuse them, so a caller
+    targeting MLX should pass a per-layer spec (or none) instead.
+    """
+    grouped: Dict[Tuple[int, int], List[str]] = {}
+    singles: List[str] = []
+    for name in layer_names:
+        m = _BLOCK_RE.search(name)
+        g = next(
+            (gi for gi, pats in enumerate(group_patterns)
+             if m and any(p in name[m.end():] for p in pats)),
+            None,
+        )
+        if g is None:
+            singles.append(name)
+        else:
+            grouped.setdefault((int(m.group(1)), g), []).append(name)
+
+    units = [
+        (sorted(names), f"block_{b}:{','.join(group_patterns[g])}")
+        for (b, g), names in sorted(grouped.items())
+    ]
+    units += [([name], name) for name in singles]
+    return [LayerGroup(i, names, pattern) for i, (names, pattern) in enumerate(units)]
 
 
 def run_build_database(
