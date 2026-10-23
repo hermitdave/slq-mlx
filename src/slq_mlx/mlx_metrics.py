@@ -16,7 +16,8 @@ def _token_nll(logits: mx.array, labels: mx.array) -> mx.array:
     logits_flat = logits.reshape(-1, logits.shape[-1])
     labels_flat = labels.reshape(-1)
     # Cross entropy
-    log_probs = mx.log_softmax(logits_flat, axis=-1)
+    # MLX has no mx.log_softmax; use log(softmax(...)).
+    log_probs = mx.log(mx.softmax(logits_flat, axis=-1))
     nll = -log_probs[mx.arange(labels_flat.shape[0]), labels_flat]
     return nll.reshape(labels.shape)
 
@@ -72,6 +73,12 @@ def _nll_kl_ear(
 ) -> Tuple[float, float, float, int]:
     """Token-mean NLL, top-K KL(p||q) and EAR."""
     model.eval()
+    # Callers pass the baseline cache straight from np.load, so coerce to MLX
+    # arrays here rather than relying on every caller to do it.
+    if not isinstance(topk_vals, mx.array):
+        topk_vals = mx.array(topk_vals)
+    if not isinstance(topk_idx, mx.array):
+        topk_idx = mx.array(topk_idx)
     nll = kl = ear = 0.0
     n = 0
 

@@ -113,11 +113,13 @@ def solve_allocation(
     # Create ILP problem
     prob = pulp.LpProblem("SLQ_Allocation", pulp.LpMinimize)
 
-    # Decision variables: x[group_idx][bw_idx] = 1 if group gets bitwidth
+    # Decision variables: x[group_idx][bw_idx] = 1 if group gets bitwidth.
+    # pulp 4.x creates variables only through LpProblem.add_variable(); the old
+    # LpVariable(name, cat=...) constructor no longer exists.
     x = {}
     for i, group in enumerate(groups):
         for j, bw in enumerate(available_bw):
-            x[(i, j)] = pulp.LpVariable(f"x_{i}_{j}", cat="Binary")
+            x[(i, j)] = prob.add_variable(f"x_{i}_{j}", cat="Binary")
 
     # Each group gets exactly one bitwidth
     for i in range(len(groups)):
@@ -137,14 +139,21 @@ def solve_allocation(
     )
 
     # Solve
-    solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=SOLVER_TIME_LIMIT_SEC)
-    prob.solve(solver)
+    # pulp 4.x: solve() returns LpSolveStats and PULP_CBC_CMD is gone; HiGHS is
+    # the bundled Rust-backed solver (needs `pip install highspy`).
+    solver = pulp.HiGHS(msg=False, timeLimit=SOLVER_TIME_LIMIT_SEC)
+    stats = prob.solve(solver)
 
-    if pulp.LpStatus[prob.status] not in ("Optimal", "Feasible"):
-        raise RuntimeError(f"ILP found no solution at avg bitwidth {target_bitwidth:.3f} (status {pulp.LpStatus[prob.status]})")
+    status = stats.status
+    if status not in (pulp.LpSolveStatus.Optimal, pulp.LpSolveStatus.TimeLimit,
+                      pulp.LpSolveStatus.SolutionLimit):
+        raise RuntimeError(
+            f"ILP found no solution at avg bitwidth {target_bitwidth:.3f} "
+            f"(status {stats.status_str})"
+        )
 
-    if pulp.LpStatus[prob.status] != "Optimal":
-        logger.warning("ILP hit time limit; using best feasible solution")
+    if status is not pulp.LpSolveStatus.Optimal:
+        logger.warning(f"ILP hit a limit; using best feasible solution (status {stats.status_str})")
 
     # Extract solution
     config = {}
@@ -196,10 +205,13 @@ def write_config(path: Path, header: Dict[str, object], config: Dict[str, int]):
 
 
 def apply_config(model: nn.Module, config: Dict[str, int], weight_store: WeightStore):
+    # Set the weight on the existing layer -- do NOT replace the module.
+    # Swapping in a raw array (or a QuantizedLinear) breaks the forward pass
+    # ("'mlx.core.array' object is not callable") and changes parameter names.
+    from .mlx_model_utils import set_submodule_weight
     for name, bw in config.items():
-        from .mlx_model_utils import set_submodule
         weight = weight_store.get_layer_weight(name, bw)
-        set_submodule(model, name, weight)
+        set_submodule_weight(model, name, weight)
 
 
 def load_calibration(args, tokenizer) -> Tuple[mx.array, Optional[mx.array]]:
@@ -266,7 +278,10 @@ def run_distribution_lossless(
         cal_data, masks = load_calibration(args, tokenizer)
         topk_vals, topk_idx = compute_baseline_topk(model, cal_data, args.batch_size, args.top_k)
         kl, ear, n = compute_kl_and_ear(model, topk_vals, topk_idx, cal_data, args.batch_size, masks)
-        ok = ear >= args.min_ear
+        # --target-bitwidth fixes the budget, so there is no EAR threshold to
+        # satisfy; --min-ear is optional here and only acts as a report gate.
+        ok = True if args.min_ear is None else ear >= args.min_ear
+        logger.info(f"EAR at {args.target_bitwidth:.2f} bpw: {ear:.4f} (KL {kl:.4f}, n={n})")
         return config, ok
 
     # Binary search on EAR
@@ -384,6 +399,8 @@ def main():
     logger.info(f"Available bitwidths: {available_bw}, bitwidth map: {bitwidth_map or 'none'}")
 
     groups = None if args.disable_grouping else extract_layer_groups(sens)
+
+    header: Dict[str, object] = {}
 
     def solve(budget):
         if not error_db.param_counts:
