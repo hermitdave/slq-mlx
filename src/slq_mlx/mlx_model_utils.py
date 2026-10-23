@@ -146,13 +146,36 @@ def get_pre_blocks(model: nn.Module, pre_block_modules: List[str]) -> List[nn.Mo
     for name in pre_block_modules:
         parts = name.split(".")
         current = model
-        for part in parts:
-            if part.isdigit():
-                current = current[int(part)]
-            else:
-                current = getattr(current, part)
-        pre_blocks.append(current)
+        try:
+            for part in parts:
+                if part.isdigit():
+                    current = current[int(part)]
+                else:
+                    current = getattr(current, part)
+            pre_blocks.append(current)
+        except AttributeError:
+            continue
     return pre_blocks
+
+
+def detect_pre_block_modules(model: nn.Module) -> List[str]:
+    """Auto-detect pre-block module names from model architecture."""
+    inner_model = model['model'] if 'model' in model else model
+    candidates_embed = ["embed_tokens", "embedding", "tok_embeddings", "wte"]
+    candidates_norm = ["norm", "final_norm", "ln_f"]
+
+    found = []
+    for name in candidates_embed:
+        if hasattr(inner_model, name):
+            found.append(name)
+            break
+
+    for name in candidates_norm:
+        if hasattr(inner_model, name):
+            found.append(name)
+            break
+
+    return found
 
 
 def get_submodule(model: nn.Module, path: str) -> nn.Module:

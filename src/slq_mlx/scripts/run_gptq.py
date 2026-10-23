@@ -17,7 +17,7 @@ from mlx_lm import load as load_model
 from slq_mlx.mlx_fast_obq import MLXFastOBQ
 from slq_mlx.mlx_quantizer import MLXQuantizer
 from slq_mlx.mlx_data import prepare_calibration_data
-from slq_mlx.mlx_model_utils import detect_quantizable_modules
+from slq_mlx.mlx_model_utils import detect_quantizable_modules, detect_pre_block_modules
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -28,7 +28,8 @@ def main():
     parser.add_argument("--model", required=True, help="HF model ID or local path")
     parser.add_argument("--quantizable-modules", default=None,
                         help="Regex matching Linear layers to quantize. Auto-detected from model architecture if omitted.")
-    parser.add_argument("--pre-block-modules", nargs="+", default=["embed_tokens", "norm"])
+    parser.add_argument("--pre-block-modules", nargs="+", default=None,
+                        help="Module names before transformer blocks, e.g. embed_tokens norm. Auto-detected if omitted.")
     parser.add_argument("--block-modules", default="layers")
     parser.add_argument("--calibration-data", default="fineweb_edu", choices=["fineweb_edu", "wikitext2", "c4"])
     parser.add_argument("--calibration-tokens", type=int, default=2**23)
@@ -58,6 +59,10 @@ def main():
     if args.quantizable_modules is None:
         args.quantizable_modules = detect_quantizable_modules(model, args.block_modules)
         logger.info(f"Auto-detected quantizable modules: {args.quantizable_modules}")
+
+    if args.pre_block_modules is None:
+        args.pre_block_modules = detect_pre_block_modules(model)
+        logger.info(f"Auto-detected pre-block modules: {args.pre_block_modules}")
 
     logger.info("Preparing calibration data...")
     seq_len = args.calibration_seq_length or model.config.max_position_embeddings
