@@ -348,23 +348,25 @@ def run_build_database(
     skip_linear: bool = False,
     shapley_bitwidths: str = "2,3,4,5,6,7,8",
     num_permutations: int = 50,
-    layer_groups: str = "",
+    layer_groups: str = "mlp.gate_proj,mlp.up_proj self_attn.k_proj,self_attn.q_proj,self_attn.v_proj",
     force_recompute: bool = False,
 ) -> Tuple[str, str]:
     """Run sensitivity database building.
 
     Returns paths to (linear_db_path, shapley_db_path).
 
-    ``layer_groups=""`` means per-layer: every layer becomes its own group, so
-    the allocation is genuinely per-layer. This is the MLX-appropriate default
-    because MLX does not fuse SwiGLU or QKV -- the upstream grouping exists only
-    so vLLM can serve fused projections at a shared bitwidth.
+    ``layer_groups`` defaults to upstream's spec, which groups only the
+    projections vLLM fuses (SwiGLU gate/up, QKV k/q/v). Groups are formed per
+    transformer block and anything matching no pattern stays a singleton, so the
+    default yields 112 groups on a 28-layer model. Pass ``""`` for a genuinely
+    per-layer allocation (196 groups) -- the MLX-native choice, since MLX does
+    not fuse those projections.
 
-    Per-layer sensitivity estimation is expensive, though: cost scales as
+    Sensitivity estimation is expensive: cost scales as
     ``len(groups) * num_levels`` metric calls for linear and
-    ``len(bitwidths) * num_perms * (1 + len(groups))`` for Shapley. At 196
-    layers that is ~9 h (linear) and ~172 h (Shapley) at 10.5 s per call, so
-    ``run_build_db.py`` refuses per-layer sensitivity unless explicitly allowed.
+    ``len(bitwidths) * num_perms * (1 + len(groups))`` for Shapley. At 112
+    groups that is ~99 h of Shapley at 10.5 s per call, so
+    ``run_build_db.py`` refuses unless ``--allow-expensive-sensitivity`` is set.
     """
     mx.random.seed(seed)
     np.random.seed(seed)

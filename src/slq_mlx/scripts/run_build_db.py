@@ -8,11 +8,24 @@ Usage:
 import argparse
 import logging
 import sys
+from pathlib import Path
 
-from slq_mlx.mlx_sensitivity import run_build_database
+from slq_mlx.mlx_sensitivity import (
+    build_layer_groups,
+    parse_group_spec,
+    run_build_database,
+)
+from slq_mlx.mlx_weight_store import ErrorDatabase
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+# Upstream scripts/run_build_database.sh groups only the projections vLLM fuses:
+# SwiGLU (gate/up) and QKV (k/q/v). Grouping is per transformer block, so the
+# remaining projections (o_proj, mlp.down_proj) stay singletons -- 112 groups on
+# a 28-layer model. MLX does not fuse them, so '' (per-layer, 196 groups) is the
+# MLX-native choice; we default to upstream's spec so numbers stay comparable.
+UPSTREAM_LAYER_GROUPS = "mlp.gate_proj,mlp.up_proj self_attn.k_proj,self_attn.q_proj,self_attn.v_proj"
 
 
 def main():
@@ -30,33 +43,37 @@ def main():
     parser.add_argument("--shapley-bitwidths", default="2,3,4,5,6,7,8")
     parser.add_argument("--num-permutations", type=int, default=50)
     parser.add_argument("--skip-shapley", action="store_true")
-    parser.add_argument("--layer-groups", default="",
+    parser.add_argument("--layer-groups", default=UPSTREAM_LAYER_GROUPS,
                         help="Groups of layers constrained to share a bitwidth (space-separated groups, "
-                             "comma-separated patterns). Default empty = per-layer, which is correct for "
-                             "MLX: MLX does not fuse SwiGLU or QKV, so the upstream grouping only exists "
-                             "to keep vLLM's fused projections at a shared bitwidth. Pass the upstream "
-                             "spec to reproduce their numbers: "
-                             "'mlp.gate_proj,mlp.up_proj,mlp.down_proj "
-                             "self_attn.k_proj,self_attn.q_proj,self_attn.v_proj,self_attn.o_proj'")
-    parser.add_argument("--allow-per-layer-sensitivity", action="store_true",
-                        help="Estimate linear/Shapley sensitivity at per-layer granularity. Expensive: "
-                             "cost scales with the number of groups, so 196 layers is ~9 h (linear) and "
-                             "~172 h (Shapley) at 10.5 s per metric call. Only meaningful for small models.")
+                             "comma-separated groups of comma-separated patterns). Groups are formed PER "
+                             "BLOCK, so anything matching no pattern stays a singleton. Default is "
+                             "upstream's spec, which exists because vLLM fuses SwiGLU (gate/up) and QKV "
+                             "(k/q/v) and those must share a bitwidth at serving time -- 112 groups on a "
+                             "28-layer model. MLX does not fuse them, so pass '' for a genuinely per-layer "
+                             "allocation (196 groups) instead.")
+    parser.add_argument("--allow-expensive-sensitivity", action="store_true",
+                        help="Run linear/Shapley sensitivity even when it is predicted to take many hours. "
+                             "Cost scales with the number of groups: 112 groups is ~99 h of Shapley and 196 "
+                             "is ~172 h at 10.5 s per metric call. Only meaningful for small models or with "
+                             "a reduced --num-permutations.")
     parser.add_argument("--force-recompute", action="store_true")
 
     args = parser.parse_args()
 
-    if not args.layer_groups.strip() and not args.allow_per_layer_sensitivity:
-        if not args.skip_linear or not args.skip_shapley:
+    if not args.allow_expensive_sensitivity:
+        n_groups = len(build_layer_groups(
+            ErrorDatabase.load(str(Path(args.layer_dir) / "error_db.json")).layer_names,
+            parse_group_spec(args.layer_groups) if args.layer_groups.strip() else [],
+        ))
+        if n_groups > 50 and not (args.skip_linear and args.skip_shapley):
+            n_bw = len([b for b in (args.shapley_bitwidths or "2,3,4,5,6,7,8").split(",") if int(b) != 8])
+            n_calls = n_bw * args.num_permutations * (1 + n_groups)
             parser.error(
-                "per-layer sensitivity estimation is impractical at this scale: "
-                "cost scales with the number of groups, and per-layer means 196 "
-                "groups (~9 h linear, ~172 h Shapley at 10.5 s per metric call). "
-                "The heuristic allocator (run_search_dl.py --method heuristic) "
-                "needs only error_db.json and is the default. Pass "
-                "--allow-per-layer-sensitivity to override, or set --layer-groups "
-                "to a coarse grouping. Note upstream's own default grouping is "
-                "per-block (112 groups here, ~99 h), not per-layer."
+                f"{n_groups} groups makes sensitivity estimation impractical: Shapley would run "
+                f"{n_calls} metric evaluations (~{n_calls * 10.5 / 3600:.0f} h at 10.5 s each). "
+                f"The heuristic allocator (run_search_dl.py --method heuristic) needs only "
+                f"error_db.json and is the default. Either pass --skip-linear --skip-shapley to "
+                f"build just the error database, or --allow-expensive-sensitivity to proceed anyway."
             )
 
     linear_path, shapley_path = run_build_database(

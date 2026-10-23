@@ -113,56 +113,55 @@ sensitivity database, and measured better than the ILP at equal budget on MLX.
 **Optional: `--method ilp`** — multiple-choice knapsack over a Shapley or linear sensitivity database.
 Requires stage 2. See the warning below: on MLX the ILP is normally *worse*, not better.
 
-### Why the ILP is not the default on MLX
+### Default grouping: upstream's spec (112 groups)
 
-Upstream groups layers before running Shapley:
+`--layer-groups` defaults to upstream's spec:
 
-```bash
-# vLLM fuses these, so they must share a bitwidth at serving time.
-LAYER_GROUPS='mlp.gate_proj,mlp.up_proj self_attn.k_proj,self_attn.q_proj,self_attn.v_proj'
+```
+mlp.gate_proj,mlp.up_proj  self_attn.k_proj,self_attn.q_proj,self_attn.v_proj
 ```
 
-That grouping exists because **vLLM fuses SwiGLU and QKV**, so those projections must share a bitwidth
-*at serving time*. **MLX does not fuse them**, so the constraint is spurious here and only costs quality.
+Groups are formed **per transformer block**, and anything matching no pattern stays a singleton — so on a
+28-layer model this yields **112 groups** (2 fused + 2 singletons per block), not 2. Grouping globally
+across all blocks would collapse the model into 2 groups and leave the sensitivity DB with only 2 distinct
+cost profiles, which is what makes the ILP nearly helpless.
+
+Pass `--layer-groups ''` for a genuinely per-layer allocation (196 groups). That is the MLX-native choice,
+because **MLX does not fuse SwiGLU or QKV** — the grouping exists because vLLM does, so those projections
+must share a bitwidth *at serving time*. The default matches upstream so numbers stay comparable.
+
+### Why the ILP is not the default on MLX
 
 Measured on Qwen3-1.7B, FineWeb-Edu 32x1024, equal ~4.5 bpw budget:
 
 | Allocator | Choices | Avg bpw | EAR | KL |
 |---|---|---|---|---|
 | **Heuristic (default)** | 196 | 4.4940 | **0.9116** | **0.0522** |
-| ILP + Shapley (grouped) | 2 | 4.5000 | 0.9072 | 0.0544 |
-| ILP + linear (grouped) | 2 | 4.5000 | 0.9072 | 0.0544 |
+| ILP + Shapley (112-group default) | 112 | 4.5000 | 0.9072 | 0.0544 |
+| ILP + linear (112-group default) | 112 | 4.5000 | 0.9072 | 0.0544 |
 
 The ILP was verified correct — exhaustive enumeration of all 49 grouped combinations confirms it found
 the true optimum of its search space (21 of 49 feasible at 4.5 bpw). The solver is fine; the grouped
 search space is too small.
 
 `--disable-grouping` is a **no-op** and will not fix this: Shapley values are computed at group
-granularity, so the sensitivity DB holds only as many distinct cost profiles as there were groups
-(measured: 196 layers, **2 distinct cost tables**). Ungrouping cannot manufacture information the DB
-does not have.
+granularity, so the sensitivity DB holds only as many distinct cost profiles as there were groups.
+Ungrouping cannot manufacture information the DB does not have.
 
-Per-layer sensitivity estimation is also **computationally infeasible** at this scale — cost scales with
-the number of groups, because Shapley walks every group in every permutation:
+### Sensitivity cost scales with group count
+
+Both estimators call the metric once per (group, level/permutation) step:
 
 | Grouping | Groups | Shapley calls @50 perms | Wall time @10.5 s |
 |---|---|---|---|
 | Global (2 pattern-sets, all blocks) | 2 | 900 | ~2.6 h |
-| **Per-block (upstream's default)** | **112** | **33,900** | **~99 h** |
-| Per-layer | 196 | 59,100 | ~172 h |
+| **Upstream default (per-block)** | **112** | **33,900** | **~99 h** |
+| Per-layer (`--layer-groups ''`) | 196 | 59,100 | ~172 h |
 
-So the grouping is a *scaling necessity*, not merely a vLLM artifact — and **upstream's own default
-granularity is already ~99 h on a single M3 Max**. `run_build_db.py` refuses per-layer sensitivity by
-default and requires `--allow-per-layer-sensitivity` to override.
-
-### Porting note: grouping must be per-block
-
-Upstream `src/models/grouping.py` keys groups on `(block_index, pattern_group)` — "Per transformer
-block, layers matching the same pattern group form one group; the rest stay singletons." Grouping
-globally instead (one group per pattern-set across all 28 blocks) collapses the model into 2 groups and
-leaves the sensitivity DB with only 2 distinct cost profiles, which is what makes the ILP nearly
-helpless. With upstream's spec on Qwen3-1.7B the correct count is **112 groups** (2 fused + 2 singletons
-per block), not 2.
+**Upstream's own default granularity is already ~99 h on a single M3 Max.** So `run_build_db.py` refuses
+sensitivity estimation above 50 groups unless you pass `--allow-expensive-sensitivity`, and it prints the
+predicted call count first. To build only `error_db.json` (all the heuristic needs) pass
+`--skip-linear --skip-shapley`.
 
 ### EAR ≥ 0.99 is not reachable on this corpus
 
