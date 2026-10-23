@@ -163,6 +163,25 @@ sensitivity estimation above 50 groups unless you pass `--allow-expensive-sensit
 predicted call count first. To build only `error_db.json` (all the heuristic needs) pass
 `--skip-linear --skip-shapley`.
 
+### Memory: `compute_baseline_topk` retains slices
+
+`mx.argsort(logits, axis=-1)[:, :, -top_k:]` is a **view** into the full `[B, T, vocab]` argsort result.
+Keeping that slice pins the whole 151,936-wide buffer, so memory grows ~0.9 GiB per batch — 128 batches
+OOMs a 64 GB machine. Fixed by copying the slices (`mx.array(...)`) before appending:
+
+| | active | peak |
+|---|---|---|
+| slice kept as a view | 92.73 GiB | 104.33 GiB |
+| slice copied | **2.32 GiB** | **13.92 GiB** |
+
+Upstream's default `512x2048` calibration now peaks at **33.93 GiB** (403 s) and `512x1024` at 18.73 GiB
+(191 s), with active memory flat at ~3.2 GiB. Note `mx.argpartition` is **not** a fix — it has the same
+view problem and measured *worse* (14.8 GiB active vs 7.8 GiB).
+
+Measure MLX memory with `mx.get_active_memory()` / `get_peak_memory()` / `get_cache_memory()`, not
+`ru_maxrss` — the latter cannot see MLX's unified-memory allocations and reads flat while a 5 GB array
+is live.
+
 ### EAR ≥ 0.99 is not reachable on this corpus
 
 The paper claims distribution-lossless compression (EAR ≥ 0.99) at ~5-6 bpw. Measured on Qwen3-1.7B,
