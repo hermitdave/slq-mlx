@@ -286,6 +286,9 @@ python scripts/run_gptq.py \
   --cal-bitwidth 4 \
   --save-dir ./quant
 
+# Layer selection is auto-detected from the model architecture by default.
+# Override with --quantizable-modules if needed (e.g. for custom models).
+
 # 2. Build the error database (built by run_build_db, or standalone below)
 python scripts/run_build_db.py \
   --model Qwen/Qwen3-8B \
@@ -412,7 +415,7 @@ and bits ∈ {2, 3, 4, 5, 6, 8}. A 7-bit layer rounds up to 8.
 
 MoE is out of scope for this port. Making it work would require:
 
-1. **Per-expert layer selection** — a `--quantizable-modules` regex that matches the target MoE naming scheme (Qwen-style `gate_proj`/`up_proj`/`down_proj` works; Mixtral-style `w1`/`w2`/`w3` does not).
+1. **Per-expert layer selection** — pass `--quantizable-modules` with a regex matching the target MoE naming scheme. For dense models this flag is optional and auto-detected; for MoE you must supply it manually. Qwen-style `gate_proj`/`up_proj`/`down_proj` works; Mixtral-style `w1`/`w2`/`w3` does not.
 2. **Per-expert grouping** — upstream `build_layer_groups` keys on `(block_index, pattern_index)`, collapsing all experts in a block into one bitwidth. Per-expert allocation needs the group key extended to include the expert index.
 3. **Group-size validation** — verify `in_features % 128 == 0` for every expert intermediate dimension before quantizing.
 4. **Router exclusion** — the MoE router/gate should be kept at BF16 and excluded from the regex.

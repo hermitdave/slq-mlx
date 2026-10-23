@@ -39,6 +39,62 @@ class InputCollector(nn.Module):
         return getattr(module, name)
 
 
+def detect_quantizable_modules(model: nn.Module, block_modules: str = "layers") -> str:
+    """Auto-detect quantizable layer regex from model architecture.
+
+    Inspects the first transformer block and builds a regex matching all
+    Linear projections under `self_attn` and `mlp`.
+
+    Args:
+        model: Loaded MLX-LM model
+        block_modules: Dotted path to the layers list, e.g. "layers"
+
+    Returns:
+        Regex string for --quantizable-modules
+    """
+    blocks = get_model_layers(model, block_modules)
+    if not blocks:
+        raise ValueError(f"No blocks found at '{block_modules}'")
+
+    first_block = blocks[0]
+    proj_attn = set()
+    proj_mlp = set()
+    prefix_attn = None
+    prefix_mlp = None
+
+    for name, submodule in first_block.named_modules():
+        if isinstance(submodule, nn.Linear):
+            parts = name.split(".")
+            if len(parts) >= 2:
+                parent = parts[-2]
+                proj = parts[-1]
+                if parent == "self_attn":
+                    prefix_attn = "self_attn"
+                    proj_attn.add(proj)
+                elif parent == "mlp":
+                    prefix_mlp = "mlp"
+                    proj_mlp.add(proj)
+
+    if not proj_attn and not proj_mlp:
+        # Fallback: match any Linear under the block that ends with _proj
+        return ".*(_proj)$"
+
+    # Exclude known non-standard projections that should not be quantized
+    # by default (e.g. Spark's attention output gate).
+    excluded = {"g_proj"}
+
+    patterns = []
+    if prefix_attn and proj_attn:
+        projs = "|".join(sorted(p for p in proj_attn if p not in excluded))
+        if projs:
+            patterns.append(f"{prefix_attn}\\.({projs})")
+    if prefix_mlp and proj_mlp:
+        projs = "|".join(sorted(proj_mlp))
+        patterns.append(f"{prefix_mlp}\\.({projs})")
+
+    return "|".join(patterns)
+
+
 def select_layers_mlx(module: nn.Module, pattern: str) -> Dict[str, nn.Linear]:
     """Select quantizable Linear layers matching pattern under module.
 
