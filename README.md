@@ -55,6 +55,39 @@ validation path: `run_simple_search.py` measures through `QuantizedLinear` (inte
 default `run_search_dl.py` path measures through the dequantized weight. Both are valid readings of the
 same allocation.
 
+### Task-level fidelity (measured)
+
+`scripts/run_zero_shot.py` scores zero-shot multiple-choice recovery against BF16 on identical
+examples. lm-eval cannot be used here (it loads task data through `datasets`, which is broken on this
+stack), so the data is fetched as parquet and scoring is done directly.
+
+Qwen3-1.7B, 400 examples per task:
+
+| Task | BF16 | SLQ 4.49bpw | recovery | paired diff | 95% CI |
+|---|---|---|---|---|---|
+| arc_easy | 0.7025 | 0.6600 | 0.9395 | **−0.0425** | [−0.0754, −0.0096] |
+| arc_challenge | 0.4000 | 0.3825 | 0.9562 | −0.0175 | [−0.0504, +0.0154] |
+| winogrande | 0.5150 | 0.4975 | 0.9660 | −0.0175 | [−0.0496, +0.0146] |
+| hellaswag | 0.3825 | 0.3850 | 1.0065 | +0.0025 | [−0.0177, +0.0227] |
+| mmlu | 0.4025 | 0.4050 | 1.0062 | +0.0025 | [−0.0304, +0.0354] |
+| **mean** | | | **0.9749** | | |
+
+**Mean recovery 0.975.** ARC-Easy is the only task with a statistically significant drop; HellaSwag
+and MMLU are indistinguishable from BF16 (they disagree on 4% of examples and split it evenly).
+
+This does **not** meet the paper's Task-Lossless bar of ≥0.99, and should not be presented as
+task-lossless. The gap is expected rather than a defect: the paper's figure assumes Shapley + ILP
+allocation at 512×2048 calibration, whereas this model uses a per-layer greedy allocation at 32×1024
+with a different grouping. It is a port with a different allocator, not a reproduction.
+
+Caveats on the harness itself: the absolute accuracies could not be validated against a reliable
+reference — the two published numbers found for Qwen3-1.7B HellaSwag disagree with each other (0.59
+zero-shot from one paper, 0.48 10-shot from a third-party card), and this harness measures 0.39
+zero-shot. Three materially different prompt formats moved accuracy by only 0.7 points, so the prompt
+template is not the cause, but the absolute scale is unverified. **Quote the recovery, not the
+absolute accuracies.** To harden it, run the same harness on a model pair with a known expected
+outcome (e.g. a lightly-quantized checkpoint) and confirm it reports ~1.0.
+
 > **EAR 0.91 at 4.5 bpw is consistent with the paper, not a defect.** SLQ's
 > Distribution-Lossless target (EAR ≥ 0.99) is defined at **5.0–6.6 bpw**;
 > 3.3–4.7 bpw is the Task-Lossless range, which does not promise EAR ≥ 0.99.
