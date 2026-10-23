@@ -406,14 +406,9 @@ def run_build_database(
         return compute_all_metrics(model, input_ids, topk_vals, topk_idx, batch_size, masks)
 
     group_patterns = parse_group_spec(layer_groups) if use_grouping else []
-    if use_grouping:
-        groups = build_layer_groups(error_db.layer_names, group_patterns)
-    else:
-        # Per-layer: every layer is its own group, so the allocator is free to
-        # give each projection a different bitwidth. This is what MLX wants --
-        # MLX does not fuse SwiGLU or QKV, so the upstream grouping (a vLLM
-        # serving constraint) would only cost quality here.
-        groups = [LayerGroup(i, [n], n) for i, n in enumerate(error_db.layer_names)]
+    # With no patterns every layer falls through to a singleton group, so ''
+    # means per-layer -- matching upstream's "'' for per-layer".
+    groups = build_layer_groups(error_db.layer_names, group_patterns)
     logger.info(f"{len(error_db.layer_names)} layers in {len(groups)} groups")
 
     meta = dict(
