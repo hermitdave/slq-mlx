@@ -52,13 +52,21 @@ def compute_baseline_topk(
     model.eval()
     vals, idx = [], []
     for i in range(0, input_ids.shape[0], batch_size):
-        batch = input_ids[i:i+batch_size]
+        batch = input_ids[i:i + batch_size]
         logits = model(batch)[:, :-1].astype(mx.float32)
         # Use argsort to get top-k indices, then gather values
         indices = mx.argsort(logits, axis=-1)[:, :, -top_k:]
         values = mx.take_along_axis(logits, indices, axis=-1)
-        vals.append(values)
-        idx.append(indices)
+        # Copy the slices out of their parents before keeping them. A slice is a
+        # VIEW, so retaining it keeps the whole [B, T, vocab] argsort result
+        # alive: measured 92.7 GiB active / 104.3 GiB peak over 40 batches,
+        # versus 2.3 / 13.9 GiB once copied. Without this, 128 batches OOMs a
+        # 64 GB machine ("[METAL] Command buffer execution failed" or the
+        # kernel killing the process at ~100 GB of compressed memory).
+        vals.append(mx.array(values))
+        idx.append(mx.array(indices))
+        mx.eval(vals[-1], idx[-1])
+        del logits, indices, values
     return mx.concatenate(vals, axis=0), mx.concatenate(idx, axis=0)
 
 
