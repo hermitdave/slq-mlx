@@ -269,14 +269,17 @@ def run_distribution_lossless(
     """Search for lowest bitwidth meeting EAR constraint."""
 
     if args.target_bitwidth is not None:
-        # Fixed target bitwidth mode
-        config = solve_fn(args.target_bitwidth)
-        # Evaluate actual EAR
+        # Fixed target bitwidth mode.
+        # The BF16 baseline MUST be captured before apply_config -- computing it
+        # afterwards compares the quantized model against itself and reports
+        # EAR 1.0 / KL 0.0 regardless of the allocation.
         model = load_model(args.model)
-        apply_config(model, config, WeightStore(args.layer_dir).load())
         tokenizer = get_tokenizer(args.model)
         cal_data, masks = load_calibration(args, tokenizer)
         topk_vals, topk_idx = compute_baseline_topk(model, cal_data, args.batch_size, args.top_k)
+
+        config = solve_fn(args.target_bitwidth)
+        apply_config(model, config, WeightStore(args.layer_dir).load())
         kl, ear, n = compute_kl_and_ear(model, topk_vals, topk_idx, cal_data, args.batch_size, masks)
         # --target-bitwidth fixes the budget, so there is no EAR threshold to
         # satisfy; --min-ear is optional here and only acts as a report gate.

@@ -324,7 +324,7 @@ def run_build_database(
     skip_linear: bool = False,
     shapley_bitwidths: str = "2,3,4,5,6,7,8",
     num_permutations: int = 50,
-    layer_groups: str = "mlp.gate_proj,mlp.up_proj self_attn.k_proj,self_attn.q_proj,self_attn.v_proj",
+    layer_groups: str = "mlp.gate_proj,mlp.up_proj,mlp.down_proj self_attn.k_proj,self_attn.q_proj,self_attn.v_proj,self_attn.o_proj",
     force_recompute: bool = False,
 ) -> Tuple[str, str]:
     """Run sensitivity database building.
