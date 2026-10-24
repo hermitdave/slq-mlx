@@ -346,6 +346,7 @@ def run_build_database(
     seed: int = 42,
     num_noise_samples: int = 15,
     skip_linear: bool = False,
+    skip_shapley: bool = False,
     shapley_bitwidths: str = "2,3,4,5,6,7,8",
     num_permutations: int = 50,
     layer_groups: str = "mlp.gate_proj,mlp.up_proj self_attn.k_proj,self_attn.q_proj,self_attn.v_proj",
@@ -386,8 +387,11 @@ def run_build_database(
     model = load_model(model_id)  # Need to implement
     tokenizer = get_tokenizer(model_id)
 
-    # Prepare calibration data
-    input_ids, masks = prepare_calibration_data(model_id, calibration_data, calibration_samples, calibration_seq_len, seed)
+    # Skip calibration data entirely if no sensitivity step needs it.
+    if not (skip_linear and skip_shapley):
+        input_ids, masks = prepare_calibration_data(model_id, calibration_data, calibration_samples, calibration_seq_len, seed)
+    else:
+        input_ids, masks = None, None
 
     # Error database
     if error_db_path.exists() and not force_recompute:
@@ -400,11 +404,15 @@ def run_build_database(
     if baseline_path.exists() and not force_recompute:
         baseline = np.load(baseline_path)
         topk_vals, topk_idx = baseline["topk_vals"], baseline["topk_idx"]
-    else:
+    elif input_ids is not None:
         topk_vals, topk_idx = compute_baseline_topk(model, input_ids, batch_size, top_k)
         np.savez(str(baseline_path), topk_vals=np.array(topk_vals), topk_idx=np.array(topk_idx))
+    else:
+        topk_vals, topk_idx = None, None
 
     def metric_fn():
+        if input_ids is None:
+            raise RuntimeError("metric_fn called without calibration data")
         return compute_all_metrics(model, input_ids, topk_vals, topk_idx, batch_size, masks)
 
     group_patterns = parse_group_spec(layer_groups) if use_grouping else []
@@ -435,7 +443,7 @@ def run_build_database(
         ), linear_path)
 
     # Shapley values
-    if force_recompute or not shapley_path.exists():
+    if not skip_shapley and (force_recompute or not shapley_path.exists()):
         gpu_cache = GPUWeightCache(model, weight_store, bitwidths, preload=True)
         nll_s, kl_s, ear_s = estimate_shapley_values(model, gpu_cache, groups, bitwidths, metric_fn, num_permutations)
         save_json(ShapleySensitivityData(
@@ -453,7 +461,7 @@ def run_build_database(
 def load_model(model_id: str) -> nn.Module:
     """Load model for calibration."""
     from mlx_lm import load
-    model, _ = load(model_id)
+    model, _ = load(model_id, trust_remote_code=True)
     return model
 
 

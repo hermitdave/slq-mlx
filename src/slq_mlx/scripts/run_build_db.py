@@ -61,8 +61,17 @@ def main():
     args = parser.parse_args()
 
     if not args.allow_expensive_sensitivity:
+        # error_db.json may not exist yet when this is the first run; fall back
+        # to scanning the layer dir directly so the heuristic path still works.
+        layer_dir_path = Path(args.layer_dir)
+        try:
+            edb = ErrorDatabase.load(str(layer_dir_path / "error_db.json"))
+            layer_names = edb.layer_names
+        except FileNotFoundError:
+            from slq_mlx.mlx_weight_store import WeightStore
+            layer_names = WeightStore(str(layer_dir_path)).load().get_layer_names()
         n_groups = len(build_layer_groups(
-            ErrorDatabase.load(str(Path(args.layer_dir) / "error_db.json")).layer_names,
+            layer_names,
             parse_group_spec(args.layer_groups) if args.layer_groups.strip() else [],
         ))
         if n_groups > 50 and not (args.skip_linear and args.skip_shapley):
@@ -87,6 +96,7 @@ def main():
         seed=args.seed,
         num_noise_samples=args.num_noise_samples,
         skip_linear=args.skip_linear,
+        skip_shapley=args.skip_shapley,
         shapley_bitwidths=args.shapley_bitwidths,
         num_permutations=args.num_permutations,
         layer_groups=args.layer_groups,

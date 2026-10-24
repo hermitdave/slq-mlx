@@ -150,13 +150,14 @@ class Model(_BaseModel):
 
     def __init__(self, args):
         super().__init__(args)
-        bits_map = getattr(args, "slq_bits", None) or {{}}
+        bits_map = getattr(args, "slq_bits", None) or {}
         for i, block in enumerate(self.layers):
             for name, layer in list(block.named_modules()):
                 if not isinstance(layer, nn.Linear):
                     continue
-                key = f"layers.{{i}}.{{name}}"
-                _set_submodule(block, name, _quantized(layer, bits_map.get(key, 8)))
+                key = f"layers.{i}.{name}"
+                if key in bits_map:
+                    _set_submodule(block, name, _quantized(layer, bits_map[key]))
 
 
 def _set_submodule(module, dotted, child):
