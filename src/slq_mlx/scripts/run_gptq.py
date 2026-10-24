@@ -63,6 +63,15 @@ def main():
 
     logger.info(f"Loading model {args.model}...")
     model, tokenizer = load_model(args.model)
+    # Apply requested dtype (default bfloat16). Quantization math stays in float32.
+    if args.dtype == "float16":
+        model.set_dtype(mx.float16)
+    elif args.dtype == "bfloat16":
+        model.set_dtype(mx.bfloat16)
+    elif args.dtype == "float32":
+        model.set_dtype(mx.float32)
+    mx.eval(model.parameters())
+    logger.info(f"Model loaded in {args.dtype}")
     # Model is already on default device in MLX-LM; ensure params are materialized
     mx.eval(model.parameters())
 

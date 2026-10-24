@@ -458,10 +458,19 @@ def run_build_database(
 
 
 # Helper functions needed - import from appropriate modules
-def load_model(model_id: str) -> nn.Module:
+def load_model(model_id: str, dtype: Optional[str] = None) -> nn.Module:
     """Load model for calibration."""
     from mlx_lm import load
     model, _ = load(model_id, trust_remote_code=True)
+    if dtype == "float16":
+        model.set_dtype(mx.float16)
+    elif dtype == "bfloat16":
+        model.set_dtype(mx.bfloat16)
+    elif dtype == "float32":
+        model.set_dtype(mx.float32)
+    mx.eval(model.parameters())
+    if dtype:
+        logger.info(f"Model loaded in {dtype}")
     return model
 
 
