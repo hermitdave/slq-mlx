@@ -9,9 +9,14 @@ given`` on every load, streaming or not). The corpora are therefore fetched as
 parquet shards with ``huggingface_hub`` and decoded with ``pyarrow`` instead.
 """
 
+import hashlib
+import json
 import logging
+import os
 import random
+from pathlib import Path
 from typing import List, Optional, Tuple
+
 import mlx.core as mx
 import numpy as np
 from transformers import AutoTokenizer
@@ -19,6 +24,78 @@ from transformers import AutoTokenizer
 logger = logging.getLogger(__name__)
 
 MASKED_DATASETS = {"gsm8k", "openthoughts"}
+
+# Default cache directory for tokenized calibration data.
+# Override with the SLQ_CALIBRATION_CACHE env var.
+DEFAULT_CALIBRATION_CACHE = Path.home() / "Projects" / "ml" / "slq_mlx" / "calibration_cache"
+
+
+def _get_cache_dir() -> Path:
+    """Return the calibration cache directory, creating it if necessary."""
+    cache_dir = Path(os.environ.get("SLQ_CALIBRATION_CACHE", DEFAULT_CALIBRATION_CACHE))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
+def _cache_key(
+    dataset: str,
+    model_id: str,
+    n_samples: int,
+    seq_len: int,
+    seed: int,
+) -> str:
+    """Build a stable cache filename from calibration parameters."""
+    payload = f"{dataset}\x00{model_id}\x00{n_samples}\x00{seq_len}\x00{seed}"
+    digest = hashlib.sha256(payload.encode()).hexdigest()[:16]
+    return f"{dataset}_{digest}.npz"
+
+
+def _load_cached_calibration(
+    cache_dir: Path,
+    key: str,
+    n_samples: int,
+) -> Optional[Tuple[mx.array, Optional[mx.array]]]:
+    """Load cached calibration data if it exists and has enough samples."""
+    path = cache_dir / key
+    if not path.exists():
+        return None
+
+    try:
+        data = np.load(path, allow_pickle=False)
+        input_ids = mx.array(data["input_ids"])
+        masks = data.get("masks")
+        masks = mx.array(masks) if masks is not None else None
+
+        if input_ids.shape[0] < n_samples:
+            logger.warning(
+                f"Cached calibration has {input_ids.shape[0]} sequences, "
+                f"need {n_samples}; will re-download"
+            )
+            return None
+
+        return input_ids, masks
+    except Exception as exc:
+        logger.warning(f"Failed to load cached calibration ({type(exc).__name__}: {exc})")
+        return None
+
+
+def _save_cached_calibration(
+    cache_dir: Path,
+    key: str,
+    input_ids: mx.array,
+    masks: Optional[mx.array],
+) -> None:
+    """Persist calibration data to the cache directory."""
+    path = cache_dir / key
+    try:
+        np.savez(
+            path,
+            input_ids=np.asarray(input_ids),
+            masks=np.asarray(masks) if masks is not None else np.array([]),
+        )
+        logger.info(f"Cached calibration data -> {path}")
+    except Exception as exc:
+        logger.warning(f"Failed to cache calibration ({type(exc).__name__}: {exc})")
 
 # (repo, filename substring) for each supported calibration corpus.
 CORPORA = {
@@ -150,9 +227,25 @@ def prepare_calibration_data(
     ``dataset`` is honoured. The previous implementation ignored it and always
     built a tiny synthetic corpus, so a requested 1M-token FineWeb-Edu run
     actually calibrated on ~10K tokens of repeated sentences.
+
+    Calibration data is cached under ``SLQ_CALIBRATION_CACHE`` (default:
+    ``~/Projects/ml/slq_mlx/calibration_cache``) so repeated runs with the same
+    dataset/model/seed reuse the tokenized sequences instead of re-downloading.
     """
     tokenizer = get_tokenizer(model_id)
     total = n_samples * seq_len
+    cache_dir = _get_cache_dir()
+    cache_key = _cache_key(dataset, model_id, n_samples, seq_len, seed)
+
+    # Try cache first.
+    cached = _load_cached_calibration(cache_dir, cache_key, n_samples)
+    if cached is not None:
+        input_ids, masks = cached
+        logger.info(
+            f"Loaded {input_ids.shape[0]} cached calibration sequences "
+            f"for {dataset} (key={cache_key})"
+        )
+        return input_ids, masks
 
     try:
         sequences = get_data(dataset, total, seq_len, tokenizer, seed=seed)
@@ -173,4 +266,7 @@ def prepare_calibration_data(
 
     input_ids = mx.stack(sequences)
     masks = mx.ones_like(input_ids) if dataset in MASKED_DATASETS else None
+
+    _save_cached_calibration(cache_dir, cache_key, input_ids, masks)
+
     return input_ids, masks
