@@ -2,12 +2,17 @@
 
 Port of [IST-DASLab SLQ](https://github.com/IST-DASLab/SLQ) (COLM 2026) to MLX for Apple Silicon.
 
-## 🤗 Pre-quantized Model on Hugging Face
+## 🤗 Pre-quantized Models on Hugging Face
 
 **Qwen3-1.7B-MLX-slq-4.49bpw** — Non-uniform SLQ quantization, 4.494 bpw
 - [hermitdave/Qwen3-1.7B-MLX-slq-4.49bpw](https://huggingface.co/hermitdave/Qwen3-1.7B-MLX-slq-4.49bpw)
 - Load with: `mlx_lm.load("hermitdave/Qwen3-1.7B-MLX-slq-4.49bpw", trust_remote_code=True)`
 - **1.40 GiB** against a 3.21 GiB BF16 base — **2.29× smaller**, packed (not dequantized)
+
+**Spark-X2.6-4B-SLQ-4.50bpw** — Non-uniform SLQ quantization, 4.494 bpw
+- [hermitdave/Spark-X2.6-4B-SLQ-4.50bpw](https://huggingface.co/hermitdave/Spark-X2.6-4B-SLQ-4.50bpw)
+- Load with: `mlx_lm.load("hermitdave/Spark-X2.6-4B-SLQ-4.50bpw", trust_remote_code=True)`
+- **2.82 GiB** against a 7.66 GiB BF16 base — **2.71× smaller**, packed (not dequantized)
 
 ## ⚠️ Model Support: Dense Models Only
 
@@ -34,7 +39,7 @@ Three concrete blockers if you tried to force a MoE model through:
 
 | Model type | Supported | Notes |
 |------------|-----------|-------|
-| Dense (Qwen3, Llama-3.x, …) | ✅ | Verified — Qwen3-1.7B at 4.494 bpw, 1.40 GiB packed artifact |
+| Dense (Qwen3, Llama-3.x, Spark-X2.6-4B, …) | ✅ | Verified — Qwen3-1.7B at 4.494 bpw, 1.40 GiB packed artifact; Spark-X2.6-4B at 4.494 bpw, 2.82 GiB |
 | MoE (Mixtral, DeepSeek, Nemotron-H, Qwen MoE, …) | ❌ | Untested — see blockers above |
 
 ## Results (Qwen3-1.7B)
@@ -92,6 +97,41 @@ outcome (e.g. a lightly-quantized checkpoint) and confirm it reports ~1.0.
 > Distribution-Lossless target (EAR ≥ 0.99) is defined at **5.0–6.6 bpw**;
 > 3.3–4.7 bpw is the Task-Lossless range, which does not promise EAR ≥ 0.99.
 > Always state which regime a number belongs to.
+
+## Results (Spark-X2.6-4B)
+
+Full 2–8 sweep, all 36 blocks GPTQ-calibrated on 8,192 FineWeb-Edu tokens (seq len 512).
+Auto-detected layer regex: `self_attn\.(q_k_v_proj|out_proj|g_proj)|mlp\.(down_proj|gate_proj|up_proj)`.
+
+| Metric | Value |
+|--------|-------|
+| **Average bitwidth** (parameter-weighted) | **4.4944 bpw** |
+| **Distribution** | 8-bit 16.7%, 5-bit 49.5%, 4-bit 33.8% |
+| **PPL** (FineWeb-Edu, 512 seq) | **BF16 23.22 → SLQ 24.52** (ratio 1.056) |
+| **Symmetric KLD** (FineWeb-Edu, 512 seq) | **7.949** |
+| **Artifact size** | **2.821 GiB** (BF16 base 7.657 GiB → 2.71×) |
+
+### Task-level fidelity (measured)
+
+`scripts/run_zero_shot.py`, 100 examples per task:
+
+| Task | BF16 | SLQ 4.50bpw | recovery | paired diff | 95% CI |
+|---|---|---|---|---|---|
+| arc_challenge | 0.4100 | 0.3600 | 0.8780 | **−0.0500** | [−0.1088, +0.0088] |
+| hellaswag | 0.4000 | 0.4000 | 1.0000 | **±0.0000** | [−0.0392, +0.0392] |
+| winogrande | 0.5500 | 0.5100 | 0.9273 | **−0.0400** | [−0.1184, +0.0384] |
+| **mean** | | | **0.9351** | | |
+
+**Mean recovery 0.935.** HellaSwag is indistinguishable from BF16; ARC-Challenge and Winogrande
+show small drops that are not statistically significant at n=100 (95% CIs cross zero).
+
+This does **not** meet the paper's Task-Lossless bar of ≥0.99. As with Qwen3-1.7B, the gap is
+expected: this run uses a per-layer greedy allocator with FineWeb-Edu 512×512 calibration, not the
+Shapley + ILP pipeline at 512×2048 from the paper.
+
+> **PPL increase of ~5.6% at 4.5 bpw is consistent with the paper's reported regime.**
+> SLQ's Task-Lossless range (3.3–4.7 bpw) does not promise PPL preservation; the
+> distribution-level EAR target (≥0.99) is defined at 5.0–6.6 bpw.
 
 ## Overview
 
