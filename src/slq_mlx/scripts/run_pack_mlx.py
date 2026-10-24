@@ -87,6 +87,7 @@ def main():
         group_size=args.group_size,
         keep_dtype=args.keep_dtype,
         subdir_name=args.subdir_name,
+        force=args.force,
     )
 
     logger.info(f"Packed checkpoint : {summary['path']}")

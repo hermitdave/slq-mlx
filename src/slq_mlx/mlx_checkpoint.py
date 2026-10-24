@@ -39,6 +39,16 @@ CARD_KEYS = (
     "predicted_kl", "predicted_ear", "predicted_recovery"
 )
 
+
+def _sanitize_model_name(model_id: str) -> str:
+    """Strip precision suffixes from a local model directory name."""
+    name = Path(model_id).name
+    for suffix in ("-BF16", "-bf16", "-FP16", "-fp16", "-F16", "-f16"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    return name
+
 # vLLM fused module mapping (for reference; not used in MLX)
 VLLM_FUSED = {
     "q_proj": "qkv_proj", "k_proj": "qkv_proj", "v_proj": "qkv_proj",
@@ -151,12 +161,16 @@ def main():
 
     metadata.setdefault("model", args.model)
 
-    out = Path(args.output_dir).expanduser() / Path(args.model).name / subdir
+    out = Path(args.output_dir).expanduser() / _sanitize_model_name(args.model) / subdir
     if out.exists():
-        if not args.force:
-            logger.error(f"{out} exists; pass --force to overwrite")
-            return 1
-        shutil.rmtree(out)
+        if args.force:
+            shutil.rmtree(out)
+        else:
+            base_out = out
+            i = 2
+            while out.exists():
+                out = Path(f"{base_out}-v{i}")
+                i += 1
 
     # Load model and apply quantization
     model = load_model(args.model)

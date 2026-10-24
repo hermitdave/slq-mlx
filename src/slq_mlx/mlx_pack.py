@@ -42,6 +42,23 @@ SUPPORTED_BITS = (2, 3, 4, 5, 6, 8)
 SUPPORTED_GROUP_SIZES = (32, 64, 128)
 
 
+def _sanitize_model_name(model_id: str) -> str:
+    """Strip precision suffixes from a local model directory name.
+
+    A user may point ``--model`` at a local BF16/FP16 checkpoint directory
+    (e.g. ``Spark-X2.6-4B-BF16``).  We do not want the packed quantized
+    checkpoint to inherit that suffix, because it implies the artifact is
+    still full-precision.  Strip common precision markers so the output
+    directory name clearly identifies the artifact as a quantized checkpoint.
+    """
+    name = Path(model_id).name
+    for suffix in ("-BF16", "-bf16", "-FP16", "-fp16", "-F16", "-f16"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    return name
+
+
 def pack_row(values: np.ndarray, bits: int) -> np.ndarray:
     """Pack one row of unsigned ints into uint32, LSB-first.
 
@@ -233,6 +250,7 @@ def pack_checkpoint(
     group_size: int = 128,
     keep_dtype: str = "float16",
     subdir_name: str = None,
+    force: bool = False,
 ) -> dict:
     """Write a packed mlx-lm checkpoint.
 
@@ -256,11 +274,21 @@ def pack_checkpoint(
     base_params = flatten(base.parameters())
     base_cfg = _base_config(model_id, base)
 
-    out = Path(output_dir) / Path(model_id).name
+    out = Path(output_dir) / _sanitize_model_name(model_id)
     if subdir_name:
         out = out / subdir_name
+
     if out.exists():
-        shutil.rmtree(out)
+        if force:
+            shutil.rmtree(out)
+        else:
+            # Find a unique directory name by appending -v2, -v3, etc.
+            base_out = out
+            i = 2
+            while out.exists():
+                out = Path(f"{base_out}-v{i}")
+                i += 1
+
     out.mkdir(parents=True)
 
     weights = {}
