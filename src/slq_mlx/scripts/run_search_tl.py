@@ -25,7 +25,7 @@ def main():
     parser.add_argument("--min-recovery", type=float, required=True)
     parser.add_argument("--seeds", default="42,1,1234")
     parser.add_argument("--baseline-json")
-    parser.add_argument("--bitwidths", default="2,3,4,5,6,7,8")
+    parser.add_argument("--bitwidths", default="2,3,4,5,6,8")
     parser.add_argument("--bitwidth-map", default="")
     parser.add_argument("--bitwidth-tolerance", type=float, default=0.1)
     parser.add_argument("--work-dir")

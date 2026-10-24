@@ -22,6 +22,9 @@ from slq_mlx.mlx_model_utils import detect_quantizable_modules, detect_pre_block
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+# MLX only supports these bitwidths for quantized_matmul.
+SUPPORTED_BITS = (2, 3, 4, 5, 6, 8)
+
 
 def main():
     parser = argparse.ArgumentParser(description="One-shot parallel GPTQ at multiple bitwidths")
@@ -34,7 +37,7 @@ def main():
     parser.add_argument("--calibration-data", default="fineweb_edu", choices=["fineweb_edu", "wikitext2", "c4"])
     parser.add_argument("--calibration-tokens", type=int, default=2**23)
     parser.add_argument("--calibration-seq-length", type=int, default=2048)
-    parser.add_argument("--bitwidths", nargs="+", type=int, default=[2,3,4,5,6,7,8], help="Bitwidths to quantize to (default: 2 3 4 5 6 7 8)")
+    parser.add_argument("--bitwidths", nargs="+", type=int, default=[2,3,4,5,6,8], help="Bitwidths to quantize to (default: 2 3 4 5 6 8)")
     parser.add_argument("--cal-bitwidth", type=int, default=4, help="Calibration bitwidth (must be in --bitwidths, default: 4)")
     parser.add_argument("--group-size", type=int, default=128)
     parser.add_argument("--sym", action="store_true", help="Symmetric quantization")
@@ -48,6 +51,13 @@ def main():
 
     if args.cal_bitwidth not in args.bitwidths:
         parser.error(f"Calibration bitwidth {args.cal_bitwidth} not in --bitwidths")
+
+    unsupported = [b for b in args.bitwidths if b not in SUPPORTED_BITS]
+    if unsupported:
+        parser.error(
+            f"MLX quantized_matmul does not support bitwidths {unsupported}; "
+            f"supported: {sorted(SUPPORTED_BITS)}"
+        )
 
     mx.random.seed(args.seed)
 

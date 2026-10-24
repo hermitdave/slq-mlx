@@ -40,7 +40,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-noise-samples", type=int, default=15)
     parser.add_argument("--skip-linear", action="store_true")
-    parser.add_argument("--shapley-bitwidths", default="2,3,4,5,6,7,8")
+    parser.add_argument("--shapley-bitwidths", default="2,3,4,5,6,8")
     parser.add_argument("--num-permutations", type=int, default=50)
     parser.add_argument("--skip-shapley", action="store_true")
     parser.add_argument("--layer-groups", default=UPSTREAM_LAYER_GROUPS,
@@ -75,7 +75,7 @@ def main():
             parse_group_spec(args.layer_groups) if args.layer_groups.strip() else [],
         ))
         if n_groups > 50 and not (args.skip_linear and args.skip_shapley):
-            n_bw = len([b for b in (args.shapley_bitwidths or "2,3,4,5,6,7,8").split(",") if int(b) != 8])
+            n_bw = len([b for b in (args.shapley_bitwidths or "2,3,4,5,6,8").split(",") if int(b) != 8])
             n_calls = n_bw * args.num_permutations * (1 + n_groups)
             parser.error(
                 f"{n_groups} groups makes sensitivity estimation impractical: Shapley would run "

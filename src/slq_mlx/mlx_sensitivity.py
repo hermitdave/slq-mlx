@@ -347,7 +347,7 @@ def run_build_database(
     num_noise_samples: int = 15,
     skip_linear: bool = False,
     skip_shapley: bool = False,
-    shapley_bitwidths: str = "2,3,4,5,6,7,8",
+    shapley_bitwidths: str = "2,3,4,5,6,8",
     num_permutations: int = 50,
     layer_groups: str = "mlp.gate_proj,mlp.up_proj self_attn.k_proj,self_attn.q_proj,self_attn.v_proj",
     force_recompute: bool = False,

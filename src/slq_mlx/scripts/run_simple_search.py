@@ -67,10 +67,10 @@ def solve_allocation_heuristic(
     one-rung reduction until the parameter-weighted average reaches the target.
 
     A rung is a single step down the available bitwidths, so a layer can travel
-    8 -> 7 -> 5 -> 3 across successive steps. The previous version only considered
+    8 -> 6 -> 5 -> 3 across successive steps. The previous version only considered
     one jump from max_bw and refused to touch a layer twice, so with more than two
-    bitwidths it always picked the shallowest jump (8 -> 7) and returned 100%
-    7-bit for a 4.5 bpw target. Layers in the same group move together.
+    bitwidths it always picked the shallowest jump (8 -> 6) and returned 100%
+    6-bit for a 4.5 bpw target. Layers in the same group move together.
     """
     bitwidth_map = bitwidth_map or {}
     groups = layer_groups or [LayerGroup(i, [n], n) for i, n in enumerate(error_db.layer_names)]
@@ -191,7 +191,7 @@ def main():
     parser.add_argument("--model", required=True)
     parser.add_argument("--layer-dir", required=True)
     parser.add_argument("--target-bits", type=float, required=True, help="Target average bits per parameter")
-    parser.add_argument("--bitwidths", default="2,3,4,5,6,7,8")
+    parser.add_argument("--bitwidths", default="2,3,4,5,6,8")
     parser.add_argument("--bitwidth-map", default="")
     parser.add_argument("--calibration-data", default="fineweb_edu",
                         choices=["fineweb_edu", "wikitext2", "c4"],
