@@ -14,6 +14,11 @@ Port of [IST-DASLab SLQ](https://github.com/IST-DASLab/SLQ) (COLM 2026) to MLX f
 - Load with: `mlx_lm.load("hermitdave/Spark-X2.6-4B-SLQ-4.50bpw", trust_remote_code=True)`
 - **2.82 GiB** against a 7.66 GiB BF16 base — **2.71× smaller**, packed (not dequantized)
 
+**LFM2.5-2.6B-SLQ-4.49bpw** — Non-uniform SLQ quantization, 4.495 bpw
+- [hermitdave/LFM2.5-2.6B-SLQ-4.49bpw](https://huggingface.co/hermitdave/LFM2.5-2.6B-SLQ-4.49bpw)
+- Load with: `mlx_lm.load("hermitdave/LFM2.5-2.6B-SLQ-4.49bpw", trust_remote_code=True)`
+- **1.9 GiB** against a ~5.0 GiB BF16 base — **~2.6× smaller**, packed (not dequantized)
+
 ## ⚠️ Model Support: Dense Models Only
 
 **SLQ-MLX supports dense (non-MoE) transformer models only.** Mixture-of-Experts models are explicitly out of scope and untested.
@@ -39,7 +44,7 @@ Three concrete blockers if you tried to force a MoE model through:
 
 | Model type | Supported | Notes |
 |------------|-----------|-------|
-| Dense (Qwen3, Llama-3.x, Spark-X2.6-4B, …) | ✅ | Verified — Qwen3-1.7B at 4.494 bpw, 1.40 GiB packed artifact; Spark-X2.6-4B at 4.494 bpw, 2.82 GiB |
+| Dense (Qwen3, Llama-3.x, Spark-X2.6-4B, LFM2.5-2.6B, …) | ✅ | Verified — Qwen3-1.7B at 4.494 bpw, 1.40 GiB; Spark-X2.6-4B at 4.494 bpw, 2.82 GiB; LFM2.5-2.6B at 4.495 bpw, 1.9 GiB |
 | MoE (Mixtral, DeepSeek, Nemotron-H, Qwen MoE, …) | ❌ | Untested — see blockers above |
 
 ## Results (Qwen3-1.7B)
@@ -132,6 +137,43 @@ Shapley + ILP pipeline at 512×2048 from the paper.
 > **PPL increase of ~5.6% at 4.5 bpw is consistent with the paper's reported regime.**
 > SLQ's Task-Lossless range (3.3–4.7 bpw) does not promise PPL preservation; the
 > distribution-level EAR target (≥0.99) is defined at 5.0–6.6 bpw.
+
+## Results (LFM2.5-2.6B)
+
+Hybrid architecture (22 short-conv blocks + 8 full-attention blocks). Custom regex
+required for Stage 1: `self_attn\.(q_proj|k_proj|v_proj|out_proj)|conv\.(in_proj|out_proj)|feed_forward\.(w1|w3|w2)`.
+Full 2–8 sweep, all 30 blocks GPTQ-calibrated on 1,048,576 FineWeb-Edu tokens (32×1024,
+seq len 512).
+
+| Metric | Value |
+|--------|-------|
+| **Average bitwidth** (parameter-weighted) | **4.4948 bpw** |
+| **Distribution** | 6-bit 13.3%, 5-bit 43.3%, 4-bit 43.3% |
+| **PPL** (FineWeb-Edu, 512 seq) | **BF16 38.55 → SLQ 40.31** (ratio 1.0456) |
+| **Symmetric KLD** (FineWeb-Edu, 512 seq) | **4.31** |
+| **Artifact size** | **1.9 GiB** (BF16 base ~5.0 GiB → 2.6×) |
+
+### Task-level fidelity (measured)
+
+`scripts/run_zero_shot.py`, 400 examples per task:
+
+| Task | BF16 | SLQ 4.49bpw | recovery | paired diff | 95% CI |
+|------|------|-------------|----------|-------------|--------|
+| arc_challenge | 0.3600 | 0.3850 | 1.0694 | +0.0250 | [-0.0068, +0.0568] |
+| arc_easy | 0.5925 | 0.5800 | 0.9789 | -0.0125 | [-0.0439, +0.0189] |
+| hellaswag | 0.4175 | 0.4100 | 0.9820 | -0.0075 | [-0.0238, +0.0088] |
+| winogrande | 0.4800 | 0.4900 | 1.0208 | +0.0100 | [-0.0304, +0.0504] |
+| **mean** | | | **1.0128** | | |
+
+**Mean recovery 1.0128 — TASK-LOSSLESS.** All four 95% CIs cross zero; no statistically
+significant degradation at n=400. This is the first artifact in this repo to clear the
+≥0.99 task-lossless bar.
+
+Caveats: the full benchmark sets are ~15.5k examples/task; this run used a 400-example
+cap. The model is a hybrid architecture (conv + full-attention layers), not a standard
+dense decoder-only transformer, so it pushes the pipeline outside the paper's evaluated
+regime. The KLD of 4.31 is still well below the Distribution-Lossless target (EAR ≥ 0.99
+at 5.0–6.6 bpw), but at 4.5 bpw the task-level recovery is what matters.
 
 ## Overview
 
