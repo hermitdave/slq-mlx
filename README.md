@@ -19,6 +19,11 @@ Port of [IST-DASLab SLQ](https://github.com/IST-DASLab/SLQ) (COLM 2026) to MLX f
 - Load with: `mlx_lm.load("hermitdave/LFM2.5-2.6B-SLQ-4.49bpw", trust_remote_code=True)`
 - **1.9 GiB** against a ~5.0 GiB BF16 base — **~2.6× smaller**, packed (not dequantized)
 
+**K2-Horizon-7B-Uno-MLX-slq-4.5bpw** — Non-uniform SLQ quantization, 4.500 bpw
+- [hermitdave/K2-Horizon-7B-Uno-MLX-slq-4.5bpw](https://huggingface.co/hermitdave/K2-Horizon-7B-Uno-MLX-slq-4.5bpw)
+- Load with: `mlx_lm.load("hermitdave/K2-Horizon-7B-Uno-MLX-slq-4.5bpw", trust_remote_code=True)`
+- **7.87 GiB** against a 18.0 GiB BF16 base — **2.29× smaller**, packed (not dequantized)
+
 ## ⚠️ Model Support: Dense Models Only
 
 **SLQ-MLX supports dense (non-MoE) transformer models only.** Mixture-of-Experts models are explicitly out of scope and untested.
@@ -174,6 +179,43 @@ cap. The model is a hybrid architecture (conv + full-attention layers), not a st
 dense decoder-only transformer, so it pushes the pipeline outside the paper's evaluated
 regime. The KLD of 4.31 is still well below the Distribution-Lossless target (EAR ≥ 0.99
 at 5.0–6.6 bpw), but at 4.5 bpw the task-level recovery is what matters.
+
+## Results (K2-Horizon-7B-Uno)
+
+Dense decoder-only transformer (36 layers, 7.6B params with merged LoRA). Auto-detected
+layer regex: `self_attn\.(k_proj|o_proj|q_proj|v_proj)|mlp\.(down_proj|gate_proj|up_proj)`.
+Full 2–8 sweep, all 36 blocks GPTQ-calibrated on 8,192 FineWeb-Edu tokens (4 × 2048,
+seq len 2048).
+
+| Metric | Value |
+|--------|-------|
+| **Average bitwidth** (parameter-weighted) | **4.500 bpw** |
+| **Distribution** | 6-bit 28.6%, 5-bit 41.7%, 4-bit 29.8% |
+| **EAR** (FineWeb-Edu, 512×2048) | **0.8985** |
+| **KL divergence** (FineWeb-Edu, 512×2048) | **0.0657** |
+| **Artifact size** | **7.87 GiB** (BF16 base 18.0 GiB → 2.29×) |
+
+### Task-level fidelity (measured)
+
+`scripts/run_zero_shot.py`, 100 examples per task:
+
+| Task | BF16 | SLQ 4.50bpw | recovery | paired diff | 95% CI |
+|------|------|-------------|----------|-------------|--------|
+| arc_challenge | 0.3200 | 0.3100 | 0.9688 | −0.0100 | [−0.0859, +0.0659] |
+| hellaswag | 0.4300 | 0.4100 | 0.9535 | −0.0200 | [−0.0477, +0.0077] |
+| winogrande | 0.5600 | 0.5500 | 0.9821 | −0.0100 | [−0.0859, +0.0659] |
+| **mean** | | | **0.9681** | | |
+
+**Mean recovery 0.968 — NOT task-lossless.** HellaSwag shows the largest relative drop
+(−4.7%); Winogrande is closest to BF16. None of the 95% CIs exclude zero at n=100, so the
+degradation is not statistically significant on this sample, but the mean is well below the
+paper's ≥0.99 threshold.
+
+Caveats: the full benchmark sets are ~15.5k examples/task; this run used a 100-example cap.
+Calibration was 4 × 2048 tokens rather than the 512 × 2048 used for smaller models, because
+the 7B model's memory footprint makes larger calibration sets expensive. The EAR of 0.8985 is
+below the 0.91 seen on Qwen3-1.7B at the same bitwidth, suggesting the 36-layer K2-Horizon
+architecture is more sensitive to quantization than the 28-layer Qwen3 base.
 
 ## Overview
 
