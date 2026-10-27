@@ -126,10 +126,30 @@ in the store.
 
 ### Caveat: MLX-Serve / oMLX
 
-Third-party serving layers (MLX-Serve, oMLX) do **not** include the `spark2_5` adapter.
-They will load the checkpoint file but fail at generation with a matmul shape mismatch
-because they do not understand the fused `q_k_v_proj` layout. Use `mlx_lm` directly or
-contribute the adapter upstream to those projects.
+Third-party serving layers (MLX-Serve, oMLX) do **not** include the `spark2_5` adapter
+by default. They will load the checkpoint file but fail at generation with a matmul shape
+mismatch because they do not understand the fused `q_k_v_proj` layout.
+
+#### MLX-Serve
+MLX-Serve does not have a `spark2_5` model adapter, so it cannot interpret the fused QKV
+layout or the custom projection names. It crashes with a matmul shape mismatch at generation.
+
+#### oMLX
+oMLX blocks loading models with custom architecture code unless `trust_remote_code` is
+enabled in `~/.omlx/model_settings.json`. Add the model entry:
+
+```json
+{
+  "models": {
+    "Spark-X2.6-1.7B-MLX-slq-4.5bpw": {
+      "trust_remote_code": true,
+      "max_context_window": 1048576
+    }
+  }
+}
+```
+
+Use `mlx_lm` directly or contribute the adapter upstream to those projects.
 
 ## Results (Qwen3-1.7B)
 
