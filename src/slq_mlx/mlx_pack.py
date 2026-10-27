@@ -115,7 +115,7 @@ stays small in memory as well as on disk.
 Load with::
 
     from mlx_lm import load
-    model, tokenizer = load(path, trust_remote_code=True)
+    model, tokenizer = load(path)
 
 ``trust_remote_code`` is required because mlx-lm imports this file to build
 the architecture. Only load checkpoints you trust.
@@ -251,6 +251,7 @@ def pack_checkpoint(
     group_size: int = 128,
     keep_dtype: str = "float16",
     subdir_name: str = None,
+    scale_dtype: str = "float16",
     force: bool = False,
 ) -> dict:
     """Write a packed mlx-lm checkpoint.
@@ -322,8 +323,25 @@ def pack_checkpoint(
         # comes back stretched.
         key = f"model.{name}"
         weights[f"{key}.weight"] = mx.array(pack_weight(np.asarray(qw), bits))
-        weights[f"{key}.scales"] = mx.array(np.asarray(scales, dtype=np.float32))
-        weights[f"{key}.biases"] = mx.array(np.asarray(zeros, dtype=np.float32))
+        
+        # Choose scale dtype with float16 range safety check
+        if scale_dtype == "float16":
+            scales_max = float(np.max(np.abs(scales)))
+            zeros_max = float(np.max(np.abs(zeros)))
+            if scales_max > 65504 or zeros_max > 65504:
+                logger.warning(
+                    f"{name}: scale/zero range exceeds float16 safe limit "
+                    f"(max scale={scales_max:.4f}, max zero={zeros_max:.4f}); "
+                    f"falling back to float32 for this layer."
+                )
+                scale_dtype_layer = np.float32
+            else:
+                scale_dtype_layer = np.float16
+        else:
+            scale_dtype_layer = np.float32
+        
+        weights[f"{key}.scales"] = mx.array(np.asarray(scales, dtype=scale_dtype_layer))
+        weights[f"{key}.biases"] = mx.array(np.asarray(zeros, dtype=scale_dtype_layer))
         bitwidths[name] = bits
 
         total_params += d_row * d_col

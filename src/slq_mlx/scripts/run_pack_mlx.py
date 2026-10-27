@@ -54,6 +54,9 @@ def main():
     parser.add_argument("--keep-dtype", default="float16",
                         choices=["float16", "float32"],
                         help="dtype for weights the search did not touch")
+    parser.add_argument("--scale-dtype", default="float16",
+                        choices=["float16", "float32"],
+                        help="dtype for quantization scales and zero points (float16 with range check)")
     parser.add_argument("--force", action="store_true", help="overwrite the output")
     args = parser.parse_args()
 
@@ -87,6 +90,7 @@ def main():
         group_size=args.group_size,
         keep_dtype=args.keep_dtype,
         subdir_name=args.subdir_name,
+        scale_dtype=args.scale_dtype,
         force=args.force,
     )
 

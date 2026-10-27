@@ -45,6 +45,9 @@ def main():
                         help="write fake-quantized float16 instead of the packed "
                              "checkpoint (always BF16-sized -- debug/fallback only)")
     parser.add_argument("--group-size", type=int, default=128)
+    parser.add_argument("--scale-dtype", default="float16",
+                        choices=["float16", "float32"],
+                        help="dtype for quantization scales and zero points")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
@@ -68,6 +71,8 @@ def main():
         cmd.extend(["--subdir-name", args.subdir_name])
     if args.force:
         cmd.append("--force")
+    if hasattr(args, 'scale_dtype'):
+        cmd.extend(["--scale-dtype", args.scale_dtype])
 
     logger.info(f"Running: {' '.join(cmd)}")
     return subprocess.run(cmd).returncode

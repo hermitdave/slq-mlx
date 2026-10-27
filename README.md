@@ -24,6 +24,25 @@ Port of [IST-DASLab SLQ](https://github.com/IST-DASLab/SLQ) (COLM 2026) to MLX f
 - Load with: `mlx_lm.load("hermitdave/K2-Horizon-7B-Uno-MLX-slq-4.5bpw", trust_remote_code=True)`
 - **7.87 GiB** against a 18.0 GiB BF16 base — **2.29× smaller**, packed (not dequantized)
 
+**Spark-X2.6-1.7B-MLX-slq-4.5bpw** — Non-uniform SLQ quantization, 4.499 bpw
+- [hermitdave/Spark-X2.6-1.7B-MLX-slq-4.5bpw](https://huggingface.co/hermitdave/Spark-X2.6-1.7B-MLX-slq-4.5bpw)
+- Load with: `mlx_lm.load("hermitdave/Spark-X2.6-1.7B-MLX-slq-4.5bpw", trust_remote_code=True)`
+- **1.30 GiB** against a 3.21 GiB BF16 base — **2.47× smaller**, packed (not dequantized)
+- Throughput: **157.5 tok/s** vs BF16 81.0 tok/s on M3 Max (64 GB) — float16 scales halve dequant bandwidth
+
+## Scale dtype: float16 with automatic float32 fallback
+
+The packer (`run_pack_mlx.py`, `run_build_ckpt.py`) defaults to `float16` for quantization scales and zero-points. This halves the dequantization bandwidth and is safe when all per-group scales/zeros lie within the float16 range (±65,504).
+
+**Automatic fallback:** if any layer’s `max(abs(scales))` or `max(abs(zeros))` exceeds 65,504, the packer logs a warning and writes that layer’s scales/zeros as `float32`. This prevents silent overflow to `inf` or underflow to `0`.
+
+Override the default with:
+```bash
+python3 -m slq_mlx.scripts.run_pack_mlx --scale-dtype float32 ...
+```
+
+For models with well-behaved weight distributions (most dense transformers up to ~7B), float16 is safe and delivers a measurable throughput win.
+
 ## ⚠️ Model Support: Dense Models Only
 
 **SLQ-MLX supports dense (non-MoE) transformer models only.** Mixture-of-Experts models are explicitly out of scope and untested.
