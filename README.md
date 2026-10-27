@@ -71,6 +71,66 @@ Three concrete blockers if you tried to force a MoE model through:
 | Dense (Qwen3, Llama-3.x, Spark-X2.6-4B, LFM2.5-2.6B, …) | ✅ | Verified — Qwen3-1.7B at 4.494 bpw, 1.40 GiB; Spark-X2.6-4B at 4.494 bpw, 2.82 GiB; LFM2.5-2.6B at 4.495 bpw, 1.9 GiB |
 | MoE (Mixtral, DeepSeek, Nemotron-H, Qwen MoE, …) | ❌ | Untested — see blockers above |
 
+## Spark model support (`spark2_5`)
+
+Spark-X2.5 and Spark-X2.6 models use a custom `spark2_5` architecture that `mlx_lm` does not ship
+natively. The SLQ pipeline can quantize and pack them, but loading the packed checkpoint through
+`mlx_lm` requires a one-time adapter install.
+
+### Install the adapter
+
+Create `mlx_lm/models/spark2_5.py` in the same Python environment that runs the SLQ scripts:
+
+```bash
+python3 - << 'PYEOF'
+import os, sys
+import mlx_lm.models
+dest = os.path.join(os.path.dirname(mlx_lm.models.__file__), "spark2_5.py")
+with open(dest, "w") as f:
+    f.write("from spark_mlx_llm.model import Model, ModelArgs\n")
+print("Wrote", dest)
+PYEOF
+```
+
+This re-exports `Model` and `ModelArgs` from the official [Spark-MLX-LLM](https://github.com/XHToken/Spark-MLX-LLM)
+repo, which you must also install:
+
+```bash
+# Spark-MLX-LLM provides the spark2_5 architecture implementation
+pip install git+https://github.com/XHToken/Spark-MLX-LLM.git
+```
+
+The adapter is only needed once per Python environment. Reinstalling `mlx-lm` will overwrite it,
+so re-run the snippet after upgrades.
+
+### Quantizable module regex
+
+Spark models use a **fused QKV projection** (`self_attn.q_k_v_proj`) instead of separate
+`q_proj`/`k_proj`/`v_proj`. Auto-detection in `run_gptq.py` handles this correctly, but the
+regex is:
+
+```
+mlp\.down_proj|mlp\.gate_proj|mlp\.up_proj|self_attn\.g_proj|self_attn\.out_proj|self_attn\.q_k_v_proj
+```
+
+That yields **6 projections per block** × **28 or 36 layers** = 168 or 224 layer directories
+in the store.
+
+### Verified models
+
+| Model | Layers | Hidden | Heads | KV heads | MLP | Store dirs |
+|-------|--------|--------|-------|----------|-----|------------|
+| Spark-X2.5-4B | 36 | 2560 | 16 | 4 | 10240 | 216 |
+| Spark-X2.6-4B | 36 | 2560 | 16 | 4 | 10240 | 216 |
+| Spark-X2.6-1.7B | 28 | 2048 | 8 | 2 | 6656 | 168 |
+
+### Caveat: MLX-Serve / oMLX
+
+Third-party serving layers (MLX-Serve, oMLX) do **not** include the `spark2_5` adapter.
+They will load the checkpoint file but fail at generation with a matmul shape mismatch
+because they do not understand the fused `q_k_v_proj` layout. Use `mlx_lm` directly or
+contribute the adapter upstream to those projects.
+
 ## Results (Qwen3-1.7B)
 
 Full 2–8 sweep, all 28 blocks GPTQ-calibrated on 1,048,576 FineWeb-Edu tokens.
