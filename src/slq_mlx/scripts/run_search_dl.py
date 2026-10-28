@@ -44,6 +44,8 @@ def main():
     parser.add_argument("--top-k", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output")
+    parser.add_argument("--trust-remote-code", action="store_true", help="Pass trust_remote_code=True for custom architectures")
+    parser.add_argument("--lazy", action="store_true", help="Load model lazily to avoid GPU timeout")
 
     args = parser.parse_args()
 
@@ -88,6 +90,10 @@ def main():
     ])
     if args.output:
         cmd.extend(["--output", args.output])
+    if args.trust_remote_code:
+        cmd.append("--trust-remote-code")
+    if args.lazy:
+        cmd.append("--lazy")
 
     logger.info(f"Running: {' '.join(cmd)}")
     result = subprocess.run(cmd)

@@ -139,7 +139,7 @@ def run_model(label, model_id, tasks, limit):
     from mlx_lm import load
 
     logger.info(f"loading {label}: {model_id}")
-    model, tokenizer = load(model_id, trust_remote_code=True)
+    model, tokenizer = load(model_id)
     results = {}
     for task in tasks:
         n, ncorr, idx = score_task(tokenizer, model, task, limit)

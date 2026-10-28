@@ -1,0 +1,10 @@
+@@ -250,7 +250,8 @@
+     group_size: int = 128,
+     keep_dtype: str = "float16",
+     subdir_name: str = None,
+-    force: bool = False,
++    scale_dtype: str = "float16",
++    force: bool = False,
+ ) -> dict:
+     """Write a packed mlx-lm checkpoint.
+ 

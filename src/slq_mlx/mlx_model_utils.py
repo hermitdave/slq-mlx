@@ -31,6 +31,8 @@ class InputCollector(nn.Module):
             kwargs = {k: v.to_device(mx.cpu) if isinstance(v, mx.array) else v for k, v in kwargs.items()}
         self.input_args.append(args)
         self.input_kwargs.append(kwargs)
+        # Materialize immediately to avoid retaining parent buffers
+        mx.eval(args, kwargs)
         raise ForwardInterrupt()
 
     def __getattr__(self, name):

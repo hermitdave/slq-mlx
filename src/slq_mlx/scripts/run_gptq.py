@@ -46,6 +46,8 @@ def main():
     parser.add_argument("--dtype", default="bfloat16", choices=["float16", "bfloat16", "float32"])
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--save-dir", required=True, help="Output directory for quantized layers")
+    parser.add_argument("--trust-remote-code", action="store_true", help="Pass trust_remote_code=True for custom architectures")
+    parser.add_argument("--lazy", action="store_true", help="Load model lazily to avoid GPU timeout on large models")
 
     args = parser.parse_args()
 
@@ -62,7 +64,7 @@ def main():
     mx.random.seed(args.seed)
 
     logger.info(f"Loading model {args.model}...")
-    model, tokenizer = load_model(args.model)
+    model, tokenizer = load_model(args.model, trust_remote_code=args.trust_remote_code, lazy=args.lazy)
     # Apply requested dtype (default bfloat16). Quantization math stays in float32.
     if args.dtype == "float16":
         model.set_dtype(mx.float16)
@@ -70,10 +72,9 @@ def main():
         model.set_dtype(mx.bfloat16)
     elif args.dtype == "float32":
         model.set_dtype(mx.float32)
-    mx.eval(model.parameters())
+    if not args.lazy:
+        mx.eval(model.parameters())
     logger.info(f"Model loaded in {args.dtype}")
-    # Model is already on default device in MLX-LM; ensure params are materialized
-    mx.eval(model.parameters())
 
     if args.quantizable_modules is None:
         args.quantizable_modules = detect_quantizable_modules(model, args.block_modules)

@@ -182,7 +182,7 @@ def run_heuristic_search(
     )
 
     # Validate against the BF16 baseline: capture it BEFORE apply_config.
-    model = load_model(args.model)
+    model = load_model(args.model, trust_remote_code=args.trust_remote_code, lazy=args.lazy)
     tokenizer = get_tokenizer(args.model)
     cal_data, masks = load_calibration(args, tokenizer)
     topk_vals, topk_idx = compute_baseline_topk(model, cal_data, args.batch_size, args.top_k)
@@ -478,6 +478,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--bitwidth-tolerance", type=float, default=0.1)
     parser.add_argument("--output")
+    parser.add_argument("--trust-remote-code", action="store_true", help="Pass trust_remote_code=True for custom architectures")
+    parser.add_argument("--lazy", action="store_true", help="Load model lazily to avoid GPU timeout")
 
     args = parser.parse_args()
 

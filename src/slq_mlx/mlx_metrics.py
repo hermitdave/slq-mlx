@@ -57,16 +57,12 @@ def compute_baseline_topk(
         # Use argsort to get top-k indices, then gather values
         indices = mx.argsort(logits, axis=-1)[:, :, -top_k:]
         values = mx.take_along_axis(logits, indices, axis=-1)
-        # Copy the slices out of their parents before keeping them. A slice is a
-        # VIEW, so retaining it keeps the whole [B, T, vocab] argsort result
-        # alive: measured 92.7 GiB active / 104.3 GiB peak over 40 batches,
-        # versus 2.3 / 13.9 GiB once copied. Without this, 128 batches OOMs a
-        # 64 GB machine ("[METAL] Command buffer execution failed" or the
-        # kernel killing the process at ~100 GB of compressed memory).
+        # Copy the slices out of their parents before keeping them.
         vals.append(mx.array(values))
         idx.append(mx.array(indices))
         mx.eval(vals[-1], idx[-1])
         del logits, indices, values
+        mx.clear_cache()
     return mx.concatenate(vals, axis=0), mx.concatenate(idx, axis=0)
 
 
@@ -111,6 +107,7 @@ def _nll_kl_ear(
         ear += float(mx.sum(mx.sum(mx.minimum(p, mx.exp(log_q)), axis=-1) * w))
 
         n += float(mx.sum(w))
+        mx.clear_cache()
 
     n = max(n, 1.0)
     return nll / n, kl / n, ear / n, int(n)
