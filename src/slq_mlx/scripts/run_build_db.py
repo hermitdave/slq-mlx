@@ -57,8 +57,32 @@ def main():
                              "is ~172 h at 10.5 s per metric call. Only meaningful for small models or with "
                              "a reduced --num-permutations.")
     parser.add_argument("--force-recompute", action="store_true")
+    parser.add_argument("--streaming", action="store_true",
+                        help="Use streaming error DB builder (build_error_db_streaming.py) instead of "
+                             "the default in-memory approach. Requires --rtn-source and --calibration.")
+    parser.add_argument("--rtn-source", default=None,
+                        help="Path to 8-bit RTN model for streaming activation capture (required with --streaming).")
+    parser.add_argument("--calibration", default=None,
+                        help="Path to .npy calibration data (required with --streaming).")
 
     args = parser.parse_args()
+
+    if args.streaming:
+        if not args.rtn_source or not args.calibration:
+            parser.error("--streaming requires --rtn-source and --calibration")
+        from slq_mlx.scripts.build_error_db_streaming import main as streaming_main
+        import sys
+        sys.argv = [
+            "build_error_db_streaming",
+            "--source", args.model,
+            "--rtn-source", args.rtn_source,
+            "--output", str(Path(args.layer_dir) / "error_db.json"),
+            "--calibration", args.calibration,
+            "--bitwidths", "2,3,4,5,6,8",
+            "--group-size", "64",
+            "--batch-size", str(args.batch_size),
+        ]
+        return streaming_main()
 
     if not args.allow_expensive_sensitivity:
         # error_db.json may not exist yet when this is the first run; fall back
