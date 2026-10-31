@@ -88,11 +88,10 @@ def _save_cached_calibration(
     """Persist calibration data to the cache directory."""
     path = cache_dir / key
     try:
-        np.savez(
-            path,
-            input_ids=np.asarray(input_ids),
-            masks=np.asarray(masks) if masks is not None else np.array([]),
-        )
+        save_dict = dict(input_ids=np.asarray(input_ids))
+        if masks is not None:
+            save_dict["masks"] = np.asarray(masks)
+        np.savez(path, **save_dict)
         logger.info(f"Cached calibration data -> {path}")
     except Exception as exc:
         logger.warning(f"Failed to cache calibration ({type(exc).__name__}: {exc})")

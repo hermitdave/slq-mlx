@@ -52,7 +52,8 @@ def main():
     args = parser.parse_args()
 
     if args.cal_bitwidth not in args.bitwidths:
-        parser.error(f"Calibration bitwidth {args.cal_bitwidth} not in --bitwidths")
+        logger.warning(f"Calibration bitwidth {args.cal_bitwidth} not in --bitwidths; using {args.bitwidths[0]} for calibration")
+        args.cal_bitwidth = args.bitwidths[0]
 
     unsupported = [b for b in args.bitwidths if b not in SUPPORTED_BITS]
     if unsupported:
@@ -98,7 +99,7 @@ def main():
         rel_damp=args.rel_damp,
     )
 
-    save_dir = Path(args.save_dir) / Path(args.model).name / f"{args.cal_bitwidth}bit"
+    save_dir = Path(args.save_dir) / f"{args.bitwidths[0] if len(args.bitwidths) == 1 else args.cal_bitwidth}bit"
     quantizer = MLXQuantizer(
         model=model,
         data_loader=data_loader,

@@ -278,9 +278,10 @@ def pack_checkpoint(
     base_params = flatten(base.parameters())
     base_cfg = _base_config(model_id, base)
 
-    out = Path(output_dir) / _sanitize_model_name(model_id)
     if subdir_name:
-        out = out / subdir_name
+        out = Path(output_dir) / subdir_name
+    else:
+        out = Path(output_dir) / _sanitize_model_name(model_id)
 
     if out.exists():
         if force:
@@ -421,9 +422,10 @@ def pack_checkpoint_streaming(
     source_dir = Path(model_id)
     base_cfg = _base_config(model_id, None)
 
-    out = Path(output_dir) / _sanitize_model_name(model_id)
     if subdir_name:
-        out = out / subdir_name
+        out = Path(output_dir) / subdir_name
+    else:
+        out = Path(output_dir) / _sanitize_model_name(model_id)
     if out.exists():
         if force:
             shutil.rmtree(out)

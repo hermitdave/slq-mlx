@@ -162,6 +162,32 @@ def solve_allocation_heuristic(
     return config
 
 
+def _validate_heuristic_config(
+    args,
+    config: Dict[str, int],
+    error_db: ErrorDatabase,
+    header: Dict[str, object],
+) -> Tuple[Dict[str, int], bool]:
+    model = load_model(args.model, trust_remote_code=args.trust_remote_code, lazy=args.lazy)
+    tokenizer = get_tokenizer(args.model)
+    cal_data, masks = load_calibration(args, tokenizer)
+    topk_vals, topk_idx = compute_baseline_topk(model, cal_data, args.batch_size, args.top_k)
+    apply_config(model, config, WeightStore(args.layer_dir).load())
+    kl, ear, n = compute_kl_and_ear(model, topk_vals, topk_idx, cal_data, args.batch_size, masks)
+    avg_bw = compute_avg_bitwidth(config, error_db.param_counts, getattr(args, "bitwidth_map", None) or {})
+    logger.info(
+        f"Heuristic allocation at {avg_bw:.2f} bpw: "
+        f"EAR {ear:.4f}, KL {kl:.4f} (n={n})"
+    )
+    header["Average bitwidth"] = f"{avg_bw:.4f}"
+    header["Validation KL"] = f"{kl:.6f}"
+    header["Validation EAR"] = f"{ear:.6f}"
+    ok = True if args.min_ear is None else ear >= args.min_ear
+    if args.min_ear is not None and not ok:
+        logger.warning(f"EAR {ear:.4f} is below --min-ear {args.min_ear}")
+    return config, ok
+
+
 def run_heuristic_search(
     args,
     error_db: ErrorDatabase,
@@ -177,26 +203,37 @@ def run_heuristic_search(
     budget on MLX (EAR 0.9116 vs 0.9072 at ~4.5 bpw on Qwen3-1.7B) because the
     upstream grouping restricts the ILP to 2 bitwidths.
     """
-    config = solve_allocation_heuristic(
-        error_db, args.target_bitwidth, available_bw, bitwidth_map, groups
+    if args.target_bitwidth is not None:
+        config = solve_allocation_heuristic(
+            error_db, args.target_bitwidth, available_bw, bitwidth_map, groups
+        )
+        return _validate_heuristic_config(args, config, error_db, header)
+
+    # Binary search on EAR when only --min-ear is specified.
+    bw_range = (
+        get_actual_bitwidth(min(available_bw), bitwidth_map),
+        get_actual_bitwidth(max(available_bw), bitwidth_map),
     )
 
-    # Validate against the BF16 baseline: capture it BEFORE apply_config.
-    model = load_model(args.model, trust_remote_code=args.trust_remote_code, lazy=args.lazy)
-    tokenizer = get_tokenizer(args.model)
-    cal_data, masks = load_calibration(args, tokenizer)
-    topk_vals, topk_idx = compute_baseline_topk(model, cal_data, args.batch_size, args.top_k)
-    apply_config(model, config, WeightStore(args.layer_dir).load())
-    kl, ear, n = compute_kl_and_ear(model, topk_vals, topk_idx, cal_data, args.batch_size, masks)
-    logger.info(
-        f"Heuristic allocation at {args.target_bitwidth:.2f} bpw: "
-        f"EAR {ear:.4f}, KL {kl:.4f} (n={n})"
-    )
+    def solve_fn(target_bw: float) -> Dict[str, int]:
+        return solve_allocation_heuristic(error_db, target_bw, available_bw, bitwidth_map, groups)
 
-    ok = True if args.min_ear is None else ear >= args.min_ear
-    if args.min_ear is not None and not ok:
-        logger.warning(f"EAR {ear:.4f} is below --min-ear {args.min_ear}")
-    return config, ok
+    def eval_fn(config: Dict[str, int]) -> bool:
+        _, ok = _validate_heuristic_config(args, config, error_db, header)
+        return ok
+
+    config, result = bisect_budget(
+        solve_fn,
+        eval_fn,
+        lambda r: r,
+        bw_range[0],
+        bw_range[1],
+        args.bitwidth_tolerance,
+    )
+    header["Search"] = "heuristic_bisect"
+    header["EAR target"] = args.min_ear
+    header["Final bitwidth"] = f"{result.get('bitwidth', 'n/a'):.4f}"
+    return config, result.get("satisfies", False)
 
 
 def solve_allocation(
@@ -385,7 +422,7 @@ def run_distribution_lossless(
         # The BF16 baseline MUST be captured before apply_config -- computing it
         # afterwards compares the quantized model against itself and reports
         # EAR 1.0 / KL 0.0 regardless of the allocation.
-        model = load_model(args.model)
+        model = load_model(args.model, trust_remote_code=args.trust_remote_code, lazy=args.lazy)
         tokenizer = get_tokenizer(args.model)
         cal_data, masks = load_calibration(args, tokenizer)
         topk_vals, topk_idx = compute_baseline_topk(model, cal_data, args.batch_size, args.top_k)
@@ -410,7 +447,7 @@ def run_distribution_lossless(
         return config, ok
 
     # Measured EAR (requires model inference at each step)
-    model = load_model(args.model)
+    model = load_model(args.model, trust_remote_code=args.trust_remote_code, lazy=args.lazy)
     weight_store = WeightStore(args.layer_dir).load()
     tokenizer = get_tokenizer(args.model)
     cal_data, masks = load_calibration(args, tokenizer)

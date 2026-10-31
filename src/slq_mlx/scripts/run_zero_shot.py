@@ -135,11 +135,16 @@ def score_task(tokenizer, model, task, limit=None):
     return len(examples), len(correct_idx), correct_idx
 
 
-def run_model(label, model_id, tasks, limit):
+def run_model(label, model_id, tasks, limit, trust_remote_code=False, lazy=False):
     from mlx_lm import load
 
     logger.info(f"loading {label}: {model_id}")
-    model, tokenizer = load(model_id)
+    model, tokenizer = load(
+        model_id,
+        tokenizer_config={"trust_remote_code": trust_remote_code},
+        trust_remote_code=trust_remote_code,
+        lazy=lazy,
+    )
     results = {}
     for task in tasks:
         n, ncorr, idx = score_task(tokenizer, model, task, limit)
@@ -160,12 +165,16 @@ def main():
     ap.add_argument("--limit", type=int, default=400,
                     help="Cap examples per task (0 = all). The full sets are ~15.5k examples "
                          "x ~4 choices x 2 models = ~124k forward passes, i.e. hours.")
+    ap.add_argument("--trust-remote-code", action="store_true")
+    ap.add_argument("--lazy", action="store_true")
     args = ap.parse_args()
 
     tasks = [t for t in args.tasks.split(",") if t]
 
-    a = run_model(args.label_a, args.model_a, tasks, args.limit)
-    b = run_model(args.label_b, args.model_b, tasks, args.limit)
+    a = run_model(args.label_a, args.model_a, tasks, args.limit,
+                  trust_remote_code=args.trust_remote_code, lazy=args.lazy)
+    b = run_model(args.label_b, args.model_b, tasks, args.limit,
+                  trust_remote_code=args.trust_remote_code, lazy=args.lazy)
 
     print()
     print(f"{'task':14s} {'n':>5s} {args.label_a:>10s} {args.label_b:>10s} "
