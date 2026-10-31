@@ -122,6 +122,16 @@ def main():
         logger.warning(f"{len(summary['rounded_up'])} layer(s) rounded up to a "
                        "supported bitwidth")
 
+    # Graft MTP head if present in base model
+    from pathlib import Path
+    import shutil
+    mtp_src = Path(args.model) / "mtp.safetensors"
+    if mtp_src.exists():
+        mtp_dst = Path(summary["path"]) / "mtp.safetensors"
+        shutil.copy2(mtp_src, mtp_dst)
+        logger.info(f"Grafted MTP head : {mtp_dst} "
+                    f"({mtp_dst.stat().st_size / 2**30:.3f} GiB)")
+
     return 0
 
 
