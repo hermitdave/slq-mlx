@@ -38,16 +38,16 @@ def main():
     # Timed run
     print(f"Benchmarking {args.max_tokens} tokens...")
     t0 = time.perf_counter()
-    text, stats = generate(
+    text = generate(
         model, tokenizer, args.prompt,
         max_tokens=args.max_tokens,
         sampler=sampler,
-        return_stats=True,
+        verbose=False,
     )
     t1 = time.perf_counter()
     mx.eval()
 
-    gen_tokens = stats.get("generated_tokens", args.max_tokens)
+    gen_tokens = len(tokenizer.encode(text)) - prompt_len
     elapsed = t1 - t0
     tps = gen_tokens / elapsed if elapsed > 0 else 0
 

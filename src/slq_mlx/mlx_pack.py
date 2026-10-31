@@ -30,6 +30,7 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+from safetensors import safe_open
 from safetensors.mlx import save_file
 
 from .mlx_weight_store import WeightStore
@@ -215,7 +216,7 @@ def parse_config(path) -> dict:
     return config
 
 
-def _base_config(model_id: str, base) -> dict:
+def _base_config(model_id: str, base=None) -> dict:
     """Read the base model's config.json, local path or HF repo."""
     local = Path(model_id) / "config.json"
     if local.exists():
@@ -253,6 +254,7 @@ def pack_checkpoint(
     subdir_name: str = None,
     scale_dtype: str = "float16",
     force: bool = False,
+    trust_remote_code: bool = False,
 ) -> dict:
     """Write a packed mlx-lm checkpoint.
 
@@ -272,7 +274,7 @@ def pack_checkpoint(
 
     from mlx_lm import load as load_mlx
 
-    base, tokenizer = load_mlx(model_id)
+    base, tokenizer = load_mlx(model_id, trust_remote_code=True, lazy=True)
     base_params = flatten(base.parameters())
     base_cfg = _base_config(model_id, base)
 
@@ -353,7 +355,7 @@ def pack_checkpoint(
     kept = 0
     for k, v in base_params.items():
         if k not in weights:
-            weights[k] = v.astype(keep_dtype_mx) if v.dtype == mx.bfloat16 else v
+            weights[k] = v.astype(keep_dtype_mx) if v.dtype == mx.float32 else v
             kept += 1
 
     save_file(weights, str(out / "model.safetensors"))
@@ -371,6 +373,230 @@ def pack_checkpoint(
     }
     (out / "config.json").write_text(json.dumps(base_cfg, indent=2))
     tokenizer.save_pretrained(str(out))
+
+    size = (out / "model.safetensors").stat().st_size
+    summary = {
+        "path": str(out),
+        "layers": len(bitwidths),
+        "kept_tensors": kept,
+        "quantized_params": total_params,
+        "average_bitwidth": param_bits / total_params,
+        "safetensors_bytes": size,
+        "rounded_up": rounded,
+    }
+    return summary
+
+
+def pack_checkpoint_streaming(
+    model_id: str,
+    layer_dir: str,
+    config_path: str,
+    output_dir: str,
+    group_size: int = 128,
+    keep_dtype: str = "float16",
+    subdir_name: str = None,
+    scale_dtype: str = "float16",
+    force: bool = False,
+    trust_remote_code: bool = False,
+) -> dict:
+    """Write a packed mlx-lm checkpoint without loading the full BF16 model.
+
+    Streams tensors from the source safetensors shards one at a time,
+    replacing quantized layers with packed MLX weights.  Peak memory is
+    roughly the output size rather than ``BF16 + output``.
+    """
+    if group_size not in SUPPORTED_GROUP_SIZES:
+        raise ValueError(
+            f"group_size {group_size} not supported by mx.quantize; "
+            f"choose one of {SUPPORTED_GROUP_SIZES}"
+        )
+
+    config = parse_config(config_path)
+    if not config:
+        raise ValueError(f"No layer bitwidths parsed from {config_path}")
+
+    store = WeightStore(layer_dir).load()
+    quantized_names = set(store.get_layer_names())
+
+    source_dir = Path(model_id)
+    base_cfg = _base_config(model_id, None)
+
+    out = Path(output_dir) / _sanitize_model_name(model_id)
+    if subdir_name:
+        out = out / subdir_name
+    if out.exists():
+        if force:
+            shutil.rmtree(out)
+        else:
+            base_out = out
+            i = 2
+            while out.exists():
+                out = Path(f"{base_out}-v{i}")
+                i += 1
+    out.mkdir(parents=True)
+
+    # Discover shards and build key -> shard mapping from the index
+    shards = sorted(source_dir.glob("*.safetensors"))
+    if not shards:
+        sys.exit(f"No safetensors shards in {source_dir}")
+
+    index_path = source_dir / "model.safetensors.index.json"
+    if index_path.exists():
+        with open(index_path) as f:
+            weight_map = json.load(f)["weight_map"]
+        all_keys = sorted(weight_map.keys())
+    else:
+        with safe_open(str(shards[0]), framework="numpy", device="cpu") as f:
+            all_keys = sorted(f.keys())
+        weight_map = {k: shards[0].name for k in all_keys}
+
+    # Group keys by shard to minimise open/close calls
+    shard_keys = {}
+    for k in all_keys:
+        shard_name = weight_map[k]
+        shard_keys.setdefault(shard_name, []).append(k)
+
+    # Mapping helpers
+    # Safetensors keys use 'model.language_model.' prefix and '.weight' suffix.
+    # MLX parameter names (after sanitize) use 'language_model.model.' and
+    # QuantizedLinear adds '.scales' / '.biases' suffixes.
+    # The model's sanitize() also adds 'language_model.' prefix to bare keys
+    # like 'lm_head.weight'.
+    def to_mlx_key(st_key: str, candidate_store: str) -> str:
+        if st_key.startswith("model.visual"):
+            return None  # skip vision encoder
+        if st_key.startswith("mtp."):
+            return None  # skip MTP head (not used in base model)
+        if st_key.startswith("model.language_model."):
+            mlx = st_key.replace("model.language_model.", "language_model.model.")
+        elif not st_key.startswith("language_model."):
+            mlx = "language_model." + st_key
+        else:
+            mlx = st_key
+        # Only strip .weight for quantized linear layers.
+        # Non-quantized weights (norms, SSM state, etc.) keep .weight.
+        if mlx.endswith(".weight") and candidate_store and any(
+            candidate_store.endswith(s) for s in (
+                ".in_proj_qkv", ".in_proj_z", ".out_proj",
+                ".gate_proj", ".up_proj", ".down_proj",
+                ".q_proj", ".k_proj", ".v_proj", ".o_proj",
+            )
+        ):
+            mlx = mlx[:-7]
+        return mlx
+
+    def to_store_name(mlx_key: str) -> str:
+        if mlx_key.startswith("language_model.model."):
+            return mlx_key[len("language_model.model."):]
+        if mlx_key.startswith("language_model."):
+            return mlx_key[len("language_model."):]
+        return mlx_key
+
+    keep_dtype_mx = {"float16": mx.float16, "float32": mx.float32}[keep_dtype]
+    weights = {}
+    bitwidths = {}
+    rounded = {}
+    total_params = param_bits = 0
+    kept = 0
+
+    for shard_name, keys in sorted(shard_keys.items()):
+        shard_path = source_dir / shard_name
+        with safe_open(str(shard_path), framework="pt", device="cpu") as f:
+            for st_key in keys:
+                # Compute a candidate store name to decide whether this is
+                # a quantized linear layer (strip .weight only for those).
+                if st_key.startswith("model.language_model."):
+                    candidate = st_key.replace("model.language_model.", "language_model.model.")
+                elif not st_key.startswith("language_model."):
+                    candidate = "language_model." + st_key
+                else:
+                    candidate = st_key
+                if candidate.endswith(".weight"):
+                    candidate = candidate[:-7]
+                candidate_store = to_store_name(candidate)
+                mlx_key = to_mlx_key(st_key, candidate_store)
+                if mlx_key is None:
+                    continue
+                store_name = to_store_name(mlx_key)
+                tensor_pt = f.get_tensor(st_key)
+
+                if store_name in quantized_names:
+                    requested = config[store_name]
+                    bits = effective_bits(requested)
+                    if bits != requested:
+                        rounded[store_name] = (requested, bits)
+                        logger.warning(
+                            f"{store_name}: {requested}-bit rounds up to {bits}-bit (mx.quantize)"
+                        )
+
+                    qw, scales, zeros, gs = store.get_qparams(store_name, bits)
+                    d_row, d_col = qw.shape
+                    if gs != group_size:
+                        raise ValueError(
+                            f"{store_name}: store group_size {gs} != requested {group_size}"
+                        )
+
+                    packed = mx.array(pack_weight(np.asarray(qw), bits))
+
+                    if scale_dtype == "float16":
+                        scales_max = float(np.max(np.abs(scales)))
+                        zeros_max = float(np.max(np.abs(zeros)))
+                        if scales_max > 65504 or zeros_max > 65504:
+                            logger.warning(
+                                f"{store_name}: scale/zero range exceeds float16 safe limit "
+                                f"(max scale={scales_max:.4f}, max zero={zeros_max:.4f}); "
+                                f"falling back to float32 for this layer."
+                            )
+                            scale_dtype_layer = np.float32
+                        else:
+                            scale_dtype_layer = np.float16
+                    else:
+                        scale_dtype_layer = np.float32
+
+                    weights[f"{mlx_key}.weight"] = packed
+                    weights[f"{mlx_key}.scales"] = mx.array(
+                        np.asarray(scales, dtype=scale_dtype_layer)
+                    )
+                    weights[f"{mlx_key}.biases"] = mx.array(
+                        np.asarray(zeros, dtype=scale_dtype_layer)
+                    )
+                    bitwidths[store_name] = bits
+                    total_params += d_row * d_col
+                    param_bits += d_row * d_col * bits
+                else:
+                    if str(tensor_pt.dtype) == "torch.bfloat16":
+                        arr = np.asarray(tensor_pt.detach().float().cpu())
+                    else:
+                        arr = np.asarray(tensor_pt.detach().cpu())
+                    if arr.dtype == np.float32:
+                        arr = arr.astype(
+                            np.float16 if keep_dtype == "float16" else np.float32
+                        )
+                    weights[mlx_key] = mx.array(arr)
+                    kept += 1
+
+    save_file(weights, str(out / "model.safetensors"))
+    (out / "slq_model.py").write_text(
+        model_module_text(base_model_module(base_cfg["model_type"]), group_size)
+    )
+
+    base_cfg["model_file"] = "slq_model.py"
+    base_cfg["slq_bits"] = json.dumps(bitwidths)
+    base_cfg["quantization_config"] = {
+        "quant_method": "slq",
+        "bits": round(param_bits / total_params, 4),
+        "group_size": group_size,
+        "format": "mlx-packed-affine",
+    }
+    (out / "config.json").write_text(json.dumps(base_cfg, indent=2))
+
+    # Copy tokenizer files
+    for tok_file in source_dir.glob("tokenizer*"):
+        shutil.copy2(tok_file, out / tok_file.name)
+    for tok_file in source_dir.glob("special_tokens*"):
+        shutil.copy2(tok_file, out / tok_file.name)
+    if (source_dir / "added_tokens.json").exists():
+        shutil.copy2(source_dir / "added_tokens.json", out / "added_tokens.json")
 
     size = (out / "model.safetensors").stat().st_size
     summary = {

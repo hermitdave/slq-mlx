@@ -30,7 +30,7 @@ import json
 import logging
 import sys
 
-from slq_mlx.mlx_pack import SUPPORTED_GROUP_SIZES, pack_checkpoint
+from slq_mlx.mlx_pack import SUPPORTED_GROUP_SIZES, pack_checkpoint, pack_checkpoint_streaming
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -58,6 +58,10 @@ def main():
                         choices=["float16", "float32"],
                         help="dtype for quantization scales and zero points (float16 with range check)")
     parser.add_argument("--force", action="store_true", help="overwrite the output")
+    parser.add_argument("--trust-remote-code", action="store_true",
+                        help="pass trust_remote_code=True to mlx_lm.load")
+    parser.add_argument("--streaming", action="store_true",
+                        help="use layer-by-layer streaming pack (no full model load)")
     args = parser.parse_args()
 
     if args.force:
@@ -82,17 +86,32 @@ def main():
     else:
         config_path = args.config
 
-    summary = pack_checkpoint(
-        model_id=args.model,
-        layer_dir=args.layer_dir,
-        config_path=config_path,
-        output_dir=args.output_dir,
-        group_size=args.group_size,
-        keep_dtype=args.keep_dtype,
-        subdir_name=args.subdir_name,
-        scale_dtype=args.scale_dtype,
-        force=args.force,
-    )
+    if args.streaming:
+        summary = pack_checkpoint_streaming(
+            model_id=args.model,
+            layer_dir=args.layer_dir,
+            config_path=config_path,
+            output_dir=args.output_dir,
+            group_size=args.group_size,
+            keep_dtype=args.keep_dtype,
+            subdir_name=args.subdir_name,
+            scale_dtype=args.scale_dtype,
+            force=args.force,
+            trust_remote_code=args.trust_remote_code,
+        )
+    else:
+        summary = pack_checkpoint(
+            model_id=args.model,
+            layer_dir=args.layer_dir,
+            config_path=config_path,
+            output_dir=args.output_dir,
+            group_size=args.group_size,
+            keep_dtype=args.keep_dtype,
+            subdir_name=args.subdir_name,
+            scale_dtype=args.scale_dtype,
+            force=args.force,
+            trust_remote_code=args.trust_remote_code,
+        )
 
     logger.info(f"Packed checkpoint : {summary['path']}")
     logger.info(f"Layers packed    : {summary['layers']}")
