@@ -106,7 +106,7 @@ CORPORA = {
 
 def get_tokenizer(model_id: str):
     """Load tokenizer for model."""
-    return AutoTokenizer.from_pretrained(model_id, use_fast=False)
+    return AutoTokenizer.from_pretrained(model_id, use_fast=True)
 
 
 def _parquet_shards(repo: str, pattern: str, seed: int) -> List[str]:

@@ -20,6 +20,7 @@ Two supported shapes of output:
     a runtime without a quantized GEMM is the target.
 """
 
+import glob
 import json
 import logging
 import os
@@ -98,6 +99,140 @@ def effective_bits(bits: int) -> int:
         if b >= bits:
             return b
     return 8
+
+
+def validate_slq_bits(model, slq_bits, output_dir, group_size):
+    """Cross-check the slq_bits map against actual weight shapes on disk.
+
+    Only validates layers that exist in the loaded model. Entries for layers
+    absent from the model (e.g. ``linear_attn`` on full-attention rows in a
+    hybrid architecture) are skipped — they are unused by the pack script but
+    harmless in the config.
+
+    Raises ``ValueError`` on any shape mismatch with a per-layer diagnostic.
+    """
+    # Build in_features from the model's actual Linear / QuantizedLinear layers
+    in_features = {}
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            in_features[name] = module.weight.shape[1]
+        elif isinstance(module, nn.QuantizedLinear):
+            in_features[name] = module.weight.shape[1] * 32 // module.bits
+
+    def _normalize_key(config_key):
+        """Convert an slq_bits config key to the model module path."""
+        if config_key.startswith("model.language_model."):
+            return "language_model.model." + config_key[len("model.language_model."):]
+        return "language_model.model." + config_key
+
+    # Load weight shapes from all output shards
+    shards = sorted(glob.glob(str(output_dir / "model*.safetensors")))
+    weight_shapes = {}
+    for shard in shards:
+        f = safe_open(shard, framework="pt")
+        for key in f.keys():
+            if key.endswith(".weight"):
+                weight_shapes[key] = f.get_tensor(key).shape
+
+    errors = []
+    skipped = 0
+    for config_key, bits in slq_bits.items():
+        mod_path = _normalize_key(config_key)
+        st_key = f"{mod_path}.weight"
+
+        if mod_path not in in_features:
+            skipped += 1
+            continue
+
+        if st_key not in weight_shapes:
+            errors.append(f"{config_key}: missing weight {st_key}")
+            continue
+
+        expected_in = in_features[mod_path]
+        shape = weight_shapes[st_key]
+        actual_bits = shape[1] * 32 / expected_in
+        if abs(actual_bits - bits) > 0.01:
+            errors.append(
+                f"{config_key}: slq_bits={bits} but weight shape {tuple(shape)} "
+                f"implies {actual_bits:.1f}-bit (in_features={expected_in})"
+            )
+
+    if skipped:
+        logger.info("Skipped %d slq_bits entries with no matching layer in model", skipped)
+
+    if errors:
+        raise ValueError(
+            "slq_bits validation failed (%d mismatch(es)):\n"
+            % len(errors)
+            + "\n".join("  - %s" % e for e in errors)
+        )
+
+
+def validate_slq_bits_consistency(slq_bits, output_dir, group_size):
+    """Internal-consistency check for the streaming pack path.
+
+    For each slq_bits entry, verifies that the packed weight shape is
+    consistent with the scales shape and the claimed bitwidth::
+
+        weight.shape[1] * 32 / bits == scales.shape[1] * group_size
+
+    This catches corrupted or mismatched bitwidth entries without needing
+    to load the full BF16 base model.
+    """
+    import glob
+    from safetensors import safe_open
+
+    shards = sorted(glob.glob(str(output_dir / "model*.safetensors")))
+    weight_shapes = {}
+    scales_shapes = {}
+    for shard in shards:
+        f = safe_open(shard, framework="pt")
+        for key in f.keys():
+            t = f.get_tensor(key)
+            if key.endswith(".weight"):
+                weight_shapes[key] = t.shape
+            elif key.endswith(".scales"):
+                scales_shapes[key] = t.shape
+
+    def _normalize_key(config_key):
+        if config_key.startswith("model.language_model."):
+            return "language_model.model." + config_key[len("model.language_model."):]
+        return "language_model.model." + config_key
+
+    errors = []
+    skipped = 0
+    for config_key, bits in slq_bits.items():
+        mod_path = _normalize_key(config_key)
+        weight_key = f"{mod_path}.weight"
+        scales_key = f"{mod_path}.scales"
+
+        if weight_key not in weight_shapes or scales_key not in scales_shapes:
+            skipped += 1
+            continue
+
+        w_shape = weight_shapes[weight_key]
+        s_shape = scales_shapes[scales_key]
+        expected_in_from_weight = w_shape[1] * 32 / bits
+        expected_in_from_scales = s_shape[1] * group_size
+        if abs(expected_in_from_weight - expected_in_from_scales) > 0.01:
+            errors.append(
+                "%s: slq_bits=%d inconsistent — weight %s implies in_features=%.0f, "
+                "scales %s implies in_features=%.0f (group_size=%d)"
+                % (
+                    config_key, bits, tuple(w_shape), expected_in_from_weight,
+                    tuple(s_shape), expected_in_from_scales, group_size,
+                )
+            )
+
+    if skipped:
+        logger.info("Skipped %d slq_bits entries (no weight+scales pair found)", skipped)
+
+    if errors:
+        raise ValueError(
+            "slq_bits consistency check failed (%d mismatch(es)):\n"
+            % len(errors)
+            + "\n".join("  - %s" % e for e in errors)
+        )
 
 
 # --------------------------------------------------------------------------
@@ -356,10 +491,19 @@ def pack_checkpoint(
     kept = 0
     for k, v in base_params.items():
         if k not in weights:
-            weights[k] = v.astype(keep_dtype_mx) if v.dtype == mx.float32 else v
+            # safetensors.mlx cannot serialise bfloat16 (no PEP 3118 buffer format).
+            # Cast both float32 and bfloat16 to the requested keep_dtype.
+            if v.dtype in (mx.float32, mx.bfloat16):
+                weights[k] = v.astype(keep_dtype_mx)
+            else:
+                weights[k] = v
             kept += 1
 
     save_file(weights, str(out / "model.safetensors"))
+
+    # Validate slq_bits matches the on-disk weight shapes before writing config
+    validate_slq_bits(base, bitwidths, out, group_size)
+
     (out / "slq_model.py").write_text(
         model_module_text(base_model_module(base_cfg["model_type"]), group_size)
     )
@@ -578,6 +722,10 @@ def pack_checkpoint_streaming(
                     kept += 1
 
     save_file(weights, str(out / "model.safetensors"))
+
+    # Validate slq_bits consistency against on-disk weight/scales shapes
+    validate_slq_bits_consistency(bitwidths, out, group_size)
+
     (out / "slq_model.py").write_text(
         model_module_text(base_model_module(base_cfg["model_type"]), group_size)
     )

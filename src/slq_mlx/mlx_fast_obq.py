@@ -164,18 +164,25 @@ class MLXFastOBQ:
         Returns:
             Dict mapping bitwidth -> (qweight [d_row, d_col] uint8, scales [d_row, n_groups], zeros [d_row, n_groups])
         """
+        import time as _time
+        t0 = _time.perf_counter()
         if self.H is None:
             # No calibration samples - use simple RTN quantization as fallback
             print(f"Warning: No calibration samples for layer, using RTN fallback")
             return self._quantize_rtn()
 
+        t1 = _time.perf_counter()
         W, H_inv_cho = self._prepare()
+        t2 = _time.perf_counter()
+        print(f"[TIMING] prepare={t2-t1:.2f}s, overhead={t1-t0:.2f}s")
         d_row, d_col, gs = self.d_row, self.d_col, self.group_size
         n_groups = d_col // gs
 
         out = {}
         for bits in self.bitwidth_options:
             maxq = 2**bits - 1
+            import time as _time
+            t_bits = _time.perf_counter()
 
             qweight = mx.zeros((d_row, d_col), dtype=mx.uint8)
             scales = mx.zeros((d_row, n_groups), dtype=mx.float32)
@@ -184,38 +191,48 @@ class MLXFastOBQ:
             w = mx.array(W)  # Working copy for error feedback
 
             # One GPTQ block per group
-            for c1 in range(0, d_col, gs):
-                c2 = c1 + gs
-                w_blk = w[:, c1:c2]  # [d_row, gs]
+            t_group_start = _time.perf_counter()
+            original_device = mx.default_device()
+            mx.set_default_device(mx.cpu)
+            try:
+                for c1 in range(0, d_col, gs):
+                    c2 = c1 + gs
+                    w_blk = w[:, c1:c2]  # [d_row, gs]
 
-                # Quantization params for this group
-                scale, zero = find_params(w_blk, bits, self.sym, self.perchannel)
-                scales[:, c1 // gs] = scale.squeeze(-1)
-                zeros[:, c1 // gs] = zero.squeeze(-1)
+                    # Quantization params for this group
+                    scale, zero = find_params(w_blk, bits, self.sym, self.perchannel)
+                    scales[:, c1 // gs] = scale.squeeze(-1)
+                    zeros[:, c1 // gs] = zero.squeeze(-1)
 
-                # Quantize with stored-precision scale
-                scale_f32 = scale.astype(mx.float32)
-                H_blk = H_inv_cho[c1:c2, c1:c2]  # [gs, gs]
+                    # Quantize with stored-precision scale
+                    scale_f32 = scale.astype(mx.float32)
+                    H_blk = H_inv_cho[c1:c2, c1:c2]  # [gs, gs]
 
-                errs = mx.zeros_like(w_blk)
-                for i in range(gs):
-                    # Quantize column i
-                    q = quantize(w_blk[:, i:i+1], scale_f32, zero.astype(mx.float32), maxq)
-                    qweight[:, c1 + i] = q.squeeze(-1)
+                    errs = mx.zeros_like(w_blk)
+                    for i in range(gs):
+                        # Quantize column i
+                        q = quantize(w_blk[:, i:i+1], scale_f32, zero.astype(mx.float32), maxq)
+                        qweight[:, c1 + i] = q.squeeze(-1)
 
-                    # Error feedback: err = (w - dequant(q)) / H_ii
-                    w_q = dequantize(q, scale_f32, zero.astype(mx.float32))
-                    err = (w_blk[:, i] - w_q.squeeze(-1)) / H_blk[i, i]
-                    errs[:, i] = err
+                        # Error feedback: err = (w - dequant(q)) / H_ii
+                        w_q = dequantize(q, scale_f32, zero.astype(mx.float32))
+                        err = (w_blk[:, i] - w_q.squeeze(-1)) / H_blk[i, i]
+                        errs[:, i] = err
 
-                    # Update remaining columns in group
-                    if i + 1 < gs:
-                        w_blk[:, i+1:] -= mx.outer(err, H_blk[i, i+1:])
+                        # Update remaining columns in group
+                        if i + 1 < gs:
+                            w_blk[:, i+1:] -= mx.outer(err, H_blk[i, i+1:])
 
-                # Propagate error to subsequent groups
-                if c2 < d_col:
-                    w[:, c2:] -= errs @ H_inv_cho[c1:c2, c2:]
+                    # Propagate error to subsequent groups
+                    if c2 < d_col:
+                        w[:, c2:] -= errs @ H_inv_cho[c1:c2, c2:]
+            finally:
+                mx.set_default_device(original_device)
 
+            mx.eval(qweight, scales, zeros)
+            import time as _time
+            t_after_eval = _time.perf_counter()
+            print(f"[TIMING] bits={bits} total={t_after_eval-t_bits:.2f}s groups={d_col//gs}")
             out[bits] = (qweight, scales, zeros)
 
         self.H = None  # Free memory

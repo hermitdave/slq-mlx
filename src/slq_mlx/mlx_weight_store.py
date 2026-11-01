@@ -29,27 +29,61 @@ class WeightStore:
         self._qparams_cache: Dict[Tuple[str, int], Tuple[mx.array, mx.array, mx.array]] = {}
 
     def load(self) -> "WeightStore":
-        """Scan directory and index available layers and bitwidths."""
+        """Scan directory and index available layers and bitwidths.
+
+        Supports two layouts:
+        1. Direct: base_dir/<layer_name>/<bw>.npy
+        2. Bitwidth-subdir: base_dir/<bw>bit/<layer_name>/<bw>.npy
+        """
         self._layer_names = []
         self._available_bitwidths = {}
 
+        # Detect bitwidth-subdir layout: look for dirs named like "2bit", "3bit", etc.
+        bitwidth_dirs = {}
+        has_bw_subdirs = False
         for entry in os.listdir(self.base_dir):
-            layer_dir = os.path.join(self.base_dir, entry)
-            if not os.path.isdir(layer_dir):
-                continue
+            entry_path = os.path.join(self.base_dir, entry)
+            if os.path.isdir(entry_path) and entry.endswith("bit"):
+                try:
+                    bw = int(entry[:-3])
+                    bitwidth_dirs[bw] = entry_path
+                    has_bw_subdirs = True
+                except ValueError:
+                    pass
 
-            bitwidths = []
-            for fname in os.listdir(layer_dir):
-                if fname.endswith(".npy"):
-                    try:
-                        bw = int(fname[:-4])
-                        bitwidths.append(bw)
-                    except ValueError:
-                        pass
+        if has_bw_subdirs:
+            # Layout 2: aggregate across all bitwidth subdirs
+            for bw, bw_dir in bitwidth_dirs.items():
+                for layer_name in os.listdir(bw_dir):
+                    layer_path = os.path.join(bw_dir, layer_name)
+                    if not os.path.isdir(layer_path):
+                        continue
+                    qweight_path = os.path.join(layer_path, f"{bw}.npy")
+                    if not os.path.exists(qweight_path):
+                        continue
+                    if layer_name not in self._available_bitwidths:
+                        self._layer_names.append(layer_name)
+                        self._available_bitwidths[layer_name] = []
+                    self._available_bitwidths[layer_name].append(bw)
+        else:
+            # Layout 1: direct subdirs per layer
+            for entry in os.listdir(self.base_dir):
+                layer_dir = os.path.join(self.base_dir, entry)
+                if not os.path.isdir(layer_dir):
+                    continue
 
-            if bitwidths:
-                self._layer_names.append(entry)
-                self._available_bitwidths[entry] = sorted(bitwidths)
+                bitwidths = []
+                for fname in os.listdir(layer_dir):
+                    if fname.endswith(".npy"):
+                        try:
+                            bw = int(fname[:-4])
+                            bitwidths.append(bw)
+                        except ValueError:
+                            pass
+
+                if bitwidths:
+                    self._layer_names.append(entry)
+                    self._available_bitwidths[entry] = sorted(bitwidths)
 
         return self
 
@@ -107,7 +141,12 @@ class WeightStore:
         Prefers the binary ``{bw}_qparams.npz`` layout and falls back to the
         legacy ``{bw}_qparams.json`` so existing stores stay readable.
         """
-        layer_dir = os.path.join(self.base_dir, layer_name)
+        # Support bitwidth-subdir layout: base_dir/<bw>bit/<layer_name>/
+        bw_dir = os.path.join(self.base_dir, f"{bitwidth}bit")
+        if os.path.isdir(bw_dir):
+            layer_dir = os.path.join(bw_dir, layer_name)
+        else:
+            layer_dir = os.path.join(self.base_dir, layer_name)
 
         # Load qweight
         qweight_path = os.path.join(layer_dir, f"{bitwidth}.npy")

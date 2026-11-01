@@ -25,6 +25,7 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+import torch
 from safetensors import safe_open
 
 
@@ -55,27 +56,24 @@ class _CaptureQuantized(nn.QuantizedLinear):
         return super().__call__(x)
 
 
+from slq_mlx.mlx_model_utils import get_submodule, set_submodule
+
+
 def wrap_linear_layers(model):
     wrapped = []
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear) and not isinstance(module, nn.QuantizedLinear):
             parent_path, _, child_name = name.rpartition(".")
-            parent = model
-            for part in parent_path.split("."):
-                if part:
-                    parent = getattr(parent, part)
-            cap = _CaptureLinear(module.input_dims, module.output_dims, module.bias is not None)
+            parent = get_submodule(model, parent_path) if parent_path else model
+            cap = _CaptureLinear(module.weight.shape[1], module.weight.shape[0], hasattr(module, "bias"))
             cap.weight = module.weight
-            setattr(parent, child_name, cap)
+            set_submodule(model, name, cap)
             wrapped.append(name)
         elif isinstance(module, nn.QuantizedLinear):
             parent_path, _, child_name = name.rpartition(".")
-            parent = model
-            for part in parent_path.split("."):
-                if part:
-                    parent = getattr(parent, part)
+            parent = get_submodule(model, parent_path) if parent_path else model
             cap = _CaptureQuantized(module)
-            setattr(parent, child_name, cap)
+            set_submodule(model, name, cap)
             wrapped.append(name)
     return wrapped
 
@@ -89,10 +87,7 @@ def _collect_activations(model, wrapped_names, calibration, batch_size=4):
         batch = mx.array(calibration[i : i + batch_size])
         model(batch)
         for name in wrapped_names:
-            module = model
-            for part in name.split("."):
-                if part:
-                    module = getattr(module, part)
+            module = get_submodule(model, name)
             x = module._last_input
             # Explicit copy to break any view that retains the parent buffer.
             x = mx.array(x)
@@ -110,14 +105,39 @@ def _collect_activations(model, wrapped_names, calibration, batch_size=4):
 # ---------------------------------------------------------------------------
 # Error measurement
 # ---------------------------------------------------------------------------
-def _measure_error(bf16_weight, qweight, scales, hessian_diag, group_size=64):
-    w = bf16_weight.astype(mx.float32)
-    q = qweight.astype(mx.float32)
-    s = scales.astype(mx.float32)
-    h = hessian_diag.astype(mx.float32)
-    wq = (q * s).T
+def _measure_error(bf16_weight, qweight, scales, zeros, hessian_diag, group_size, bits):
+    # bf16_weight may come from safetensors as a torch tensor or numpy array
+    if hasattr(bf16_weight, "detach"):
+        bf16_weight = np.asarray(bf16_weight.detach().cpu().to(torch.float32))
+    else:
+        bf16_weight = np.asarray(bf16_weight)
+    w = bf16_weight.astype(np.float32)
+
+    q = np.asarray(qweight)
+    s = np.asarray(scales)
+    z = np.asarray(zeros) if zeros is not None else np.zeros_like(s)
+    h = np.asarray(hessian_diag).astype(np.float32) if hessian_diag is not None else np.ones(w.shape[1])
+
+    # mx.quantize returns packed uint32: [output_dim, packed_cols]
+    # Unpack to [output_dim, input_dim] for comparison
+    if bits < 32:
+        vals_per_word = q.dtype.itemsize * 8 // bits
+        total_elements = q.shape[1] * vals_per_word
+        q_unpacked = np.zeros((q.shape[0], total_elements), dtype=np.int32)
+        mask = (1 << bits) - 1
+        for i in range(vals_per_word):
+            q_unpacked[:, i::vals_per_word] = ((q >> (bits * i)) & mask).astype(np.int32)
+        q = q_unpacked
+
+    # Expand s/z from [output_dim, num_groups] to [output_dim, input_dim]
+    repeat = w.shape[1] // s.shape[1]
+    if repeat > 1:
+        s = np.repeat(s, repeat, axis=1)
+        z = np.repeat(z, repeat, axis=1)
+
+    wq = (q.astype(np.float32) * s + z)
     diff = w - wq
-    err = float(mx.sum(diff * diff * h) / (mx.sum(w * w * h) + 1e-12))
+    err = float(np.sum(diff * diff * h) / (np.sum(w * w * h) + 1e-12))
     return err
 
 
@@ -152,8 +172,9 @@ def main():
     del rtn_model
     mx.eval(mx.zeros(1))
 
-    # Phase 2: per-tensor error measurement
-    print("[phase 2] measuring per-tensor quant error ...")
+    # Phase 2: per-tensor error measurement from Stage 1 outputs
+    print("[phase 2] measuring per-tensor quant error from Stage 1 outputs ...")
+    quant_dir = source.parent / "quant"
     shards = sorted(source.glob("*.safetensors"))
     shard_map = {}
     for shard in shards:
@@ -164,26 +185,59 @@ def main():
     db = {"layers": {}, "param_counts": {}}
     all_errors = 0
 
-    for shard in shards:
-        with safe_open(str(shard), framework="pt", device="cpu") as f:
-            keys = [k for k in f.keys() if k.endswith(".weight") and "mtp" not in k]
-            for key in keys:
-                base = key[:-7]
-                if base not in hessian_map:
-                    continue
-                w = f.get_tensor(key)
-                param_count = int(np.prod(w.shape))
+    for bw in bitwidths:
+        bw_dir = quant_dir / f"{bw}bit"
+        if not bw_dir.exists():
+            print(f"  WARNING: {bw_dir} missing, skipping bitwidth {bw}")
+            continue
+        for layer_dir in sorted(bw_dir.iterdir()):
+            if not layer_dir.is_dir():
+                continue
+            base = layer_dir.name
+            qweight_path = layer_dir / f"{bw}.npy"
+            qparams_path = layer_dir / f"{bw}_qparams.npz"
+            if not qweight_path.exists() or not qparams_path.exists():
+                continue
+            qweight = np.load(qweight_path)
+            qp = np.load(qparams_path)
+            scales = qp["scales"]
+            zeros = qp["zeros"]
+
+            # Load BF16 weight from source shards (BF16 shard keys have `model.` prefix)
+            shard_key = f"model.{base}.weight" if not base.startswith("model.") else f"{base}.weight"
+            if shard_key not in shard_map:
+                continue
+            with safe_open(str(shard_map[shard_key]), framework="pt", device="cpu") as f:
+                w = f.get_tensor(shard_key)
+            if hasattr(w, "detach"):
+                w = np.asarray(w.detach().cpu().to(torch.float32))
+            else:
+                w = np.asarray(w).astype(np.float32)
+
+            param_count = int(np.prod(w.shape))
+            if base not in db["param_counts"]:
                 db["param_counts"][base] = param_count
-                layer_errors = {}
-                for bw in bitwidths:
-                    # Simulate quantize→dequant
-                    q, s = mx.quantize(mx.array(w), group_size=args.group_size, bits=bw)
-                    q_np = np.array(q.astype(mx.int8))
-                    s_np = np.array(s.astype(mx.float32))
-                    err = _measure_error(w, q_np, s_np, hessian_map[base], args.group_size)
-                    layer_errors[str(bw)] = {"error": err}
-                    all_errors += 1
-                db["layers"][base] = layer_errors
+
+            # Dequantize: qweight is [output_dim, input_dim] (unpacked uint8)
+            # scales/zeros are [output_dim, num_groups]; expand to full input dim
+            repeat = w.shape[1] // scales.shape[1]
+            if repeat > 1:
+                s_exp = np.repeat(scales, repeat, axis=1)
+                z_exp = np.repeat(zeros, repeat, axis=1)
+            else:
+                s_exp = scales
+                z_exp = zeros
+            wq = (qweight.astype(np.float32) * s_exp + z_exp)
+
+            hessian = hessian_map.get(base)
+            h = np.asarray(hessian).astype(np.float32) if hessian is not None else np.ones(w.shape[1])
+            diff = w - wq
+            err = float(np.sum(diff * diff * h) / (np.sum(w * w * h) + 1e-12))
+
+            if base not in db["layers"]:
+                db["layers"][base] = {}
+            db["layers"][base][str(bw)] = {"error": err}
+            all_errors += 1
 
     output.write_text(json.dumps(db, indent=2))
     print(f"\nDone. Wrote {output}")
