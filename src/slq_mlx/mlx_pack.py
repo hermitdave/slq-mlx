@@ -459,7 +459,11 @@ def pack_checkpoint(
     if subdir_name:
         out = Path(output_dir) / subdir_name
     else:
-        out = Path(output_dir) / _sanitize_model_name(model_id)
+        sanitized = _sanitize_model_name(model_id)
+        if sanitized.lower() in ("bf16", "fp16", "f16", ""):
+            out = Path(output_dir)
+        else:
+            out = Path(output_dir) / sanitized
 
     if out.exists():
         if force:
@@ -612,7 +616,11 @@ def pack_checkpoint_streaming(
     if subdir_name:
         out = Path(output_dir) / subdir_name
     else:
-        out = Path(output_dir) / _sanitize_model_name(model_id)
+        sanitized = _sanitize_model_name(model_id)
+        if sanitized.lower() in ("bf16", "fp16", "f16", ""):
+            out = Path(output_dir)
+        else:
+            out = Path(output_dir) / sanitized
     if out.exists():
         if force:
             shutil.rmtree(out)
