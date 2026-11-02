@@ -59,22 +59,32 @@ class _CaptureQuantized(nn.QuantizedLinear):
 from slq_mlx.mlx_model_utils import get_submodule, set_submodule
 
 
+def _normalize_key(key: str) -> str:
+    """Strip HF wrapper prefixes so layer dir names like 'layers.0.mlp.gate_proj' match."""
+    for prefix in ("model.language_model.", "model."):
+        if key.startswith(prefix):
+            return key[len(prefix):]
+    return key
+
+
 def wrap_linear_layers(model):
     wrapped = []
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear) and not isinstance(module, nn.QuantizedLinear):
-            parent_path, _, child_name = name.rpartition(".")
+            norm_name = _normalize_key(name)
+            parent_path, _, child_name = norm_name.rpartition(".")
             parent = get_submodule(model, parent_path) if parent_path else model
             cap = _CaptureLinear(module.weight.shape[1], module.weight.shape[0], hasattr(module, "bias"))
             cap.weight = module.weight
             set_submodule(model, name, cap)
-            wrapped.append(name)
+            wrapped.append(norm_name)
         elif isinstance(module, nn.QuantizedLinear):
-            parent_path, _, child_name = name.rpartition(".")
+            norm_name = _normalize_key(name)
+            parent_path, _, child_name = norm_name.rpartition(".")
             parent = get_submodule(model, parent_path) if parent_path else model
             cap = _CaptureQuantized(module)
             set_submodule(model, name, cap)
-            wrapped.append(name)
+            wrapped.append(norm_name)
     return wrapped
 
 
@@ -146,7 +156,8 @@ def main():
     ap.add_argument("--source", required=True, help="BF16 source model dir")
     ap.add_argument("--rtn-source", required=True, help="8-bit RTN model dir")
     ap.add_argument("--output", required=True, help="Output error_db.json path")
-    ap.add_argument("--calibration", required=True, help=".npy calibration data")
+    ap.add_argument("--calibration", default=None,
+                    help=".npy calibration data (default: ~/Projects/ml/calibration_cache/fineweb_edu_128k_1024.npy)")
     ap.add_argument("--bitwidths", default="2,3,4,6,8", help="Comma-separated bitwidths")
     ap.add_argument("--group-size", type=int, default=64)
     ap.add_argument("--batch-size", type=int, default=4)
@@ -165,7 +176,8 @@ def main():
     wrapped = wrap_linear_layers(rtn_model)
     print(f"  Wrapped {len(wrapped)} linear layers")
 
-    calibration = np.load(args.calibration)
+    calibration_path = args.calibration or str(Path.home() / "Projects" / "ml" / "calibration_cache" / "fineweb_edu_128k_1024.npy")
+    calibration = np.load(calibration_path)
     print(f"  Running calibration (batch_size={args.batch_size}) ...")
     hessian_map = _collect_activations(rtn_model, wrapped, calibration, batch_size=args.batch_size)
     print(f"  Captured Hessian diagonals for {len(hessian_map)} layers")
@@ -203,9 +215,19 @@ def main():
             scales = qp["scales"]
             zeros = qp["zeros"]
 
-            # Load BF16 weight from source shards (BF16 shard keys have `model.` prefix)
-            shard_key = f"model.{base}.weight" if not base.startswith("model.") else f"{base}.weight"
-            if shard_key not in shard_map:
+            # Load BF16 weight from source shards (BF16 shard keys may have `model.` or `model.language_model.` prefix)
+            candidates = [
+                f"model.{base}.weight",
+                f"model.language_model.{base}.weight",
+            ]
+            if base.startswith("model."):
+                candidates = [f"{base}.weight"]
+            shard_key = None
+            for c in candidates:
+                if c in shard_map:
+                    shard_key = c
+                    break
+            if shard_key is None:
                 continue
             with safe_open(str(shard_map[shard_key]), framework="pt", device="cpu") as f:
                 w = f.get_tensor(shard_key)

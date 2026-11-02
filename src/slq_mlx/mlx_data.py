@@ -96,6 +96,16 @@ def _save_cached_calibration(
     except Exception as exc:
         logger.warning(f"Failed to cache calibration ({type(exc).__name__}: {exc})")
 
+    # Also write a canonical .npy for cross-script reuse (Stage 2, Stage 3, etc.)
+    try:
+        canonical_dir = Path.home() / "Projects" / "ml" / "calibration_cache"
+        canonical_dir.mkdir(parents=True, exist_ok=True)
+        canonical_path = canonical_dir / "fineweb_edu_128k_1024.npy"
+        np.save(canonical_path, np.asarray(input_ids))
+        logger.info(f"Wrote canonical calibration cache -> {canonical_path}")
+    except Exception as exc:
+        logger.warning(f"Failed to write canonical calibration cache ({type(exc).__name__}: {exc})")
+
 # (repo, filename substring) for each supported calibration corpus.
 CORPORA = {
     "fineweb_edu": ("HuggingFaceFW/fineweb-edu", ".parquet"),

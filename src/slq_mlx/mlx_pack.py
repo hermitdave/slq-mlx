@@ -101,6 +101,26 @@ def effective_bits(bits: int) -> int:
     return 8
 
 
+def _normalize_key(config_key: str, known_paths) -> str:
+    """Convert an slq_bits config key to the model module path.
+
+    Config keys are like ``layers.0.mlp.gate_proj``.  Model paths may be:
+      - ``model.layers.0.mlp.gate_proj`` (1.7B)
+      - ``model.language_model.layers.0.mlp.gate_proj`` (2B+ original)
+      - ``language_model.model.layers.0.mlp.gate_proj`` (2B+ wrapped)
+    """
+    candidates = [
+        f"model.{config_key}",
+        f"model.language_model.{config_key}",
+        f"language_model.model.{config_key}",
+    ]
+    for c in candidates:
+        if c in known_paths:
+            return c
+    # Fallback: return the most specific guess
+    return f"language_model.model.{config_key}"
+
+
 def validate_slq_bits(model, slq_bits, output_dir, group_size):
     """Cross-check the slq_bits map against actual weight shapes on disk.
 
@@ -119,12 +139,6 @@ def validate_slq_bits(model, slq_bits, output_dir, group_size):
         elif isinstance(module, nn.QuantizedLinear):
             in_features[name] = module.weight.shape[1] * 32 // module.bits
 
-    def _normalize_key(config_key):
-        """Convert an slq_bits config key to the model module path."""
-        if config_key.startswith("model.language_model."):
-            return "language_model.model." + config_key[len("model.language_model."):]
-        return "language_model.model." + config_key
-
     # Load weight shapes from all output shards
     shards = sorted(glob.glob(str(output_dir / "model*.safetensors")))
     weight_shapes = {}
@@ -137,19 +151,31 @@ def validate_slq_bits(model, slq_bits, output_dir, group_size):
     errors = []
     skipped = 0
     for config_key, bits in slq_bits.items():
-        mod_path = _normalize_key(config_key)
-        st_key = f"{mod_path}.weight"
+        mod_path = _normalize_key(config_key, in_features)
 
         if mod_path not in in_features:
             skipped += 1
             continue
 
-        if st_key not in weight_shapes:
-            errors.append(f"{config_key}: missing weight {st_key}")
+        expected_in = in_features[mod_path]
+
+        # The packed checkpoint may write weights under different prefixes
+        # depending on model architecture (1.7B vs 2B+). Try all candidates.
+        candidates = [
+            f"model.{config_key}.weight",          # quantized output (1.7B)
+            f"language_model.model.{config_key}.weight",  # kept BF16 (2B)
+            f"model.language_model.{config_key}.weight",  # original BF16 model path
+        ]
+        shape = None
+        for c in candidates:
+            if c in weight_shapes:
+                shape = weight_shapes[c]
+                break
+
+        if shape is None:
+            errors.append(f"{config_key}: missing weight (tried {candidates})")
             continue
 
-        expected_in = in_features[mod_path]
-        shape = weight_shapes[st_key]
         actual_bits = shape[1] * 32 / expected_in
         if abs(actual_bits - bits) > 0.01:
             errors.append(
@@ -194,19 +220,34 @@ def validate_slq_bits_consistency(slq_bits, output_dir, group_size):
             elif key.endswith(".scales"):
                 scales_shapes[key] = t.shape
 
-    def _normalize_key(config_key):
-        if config_key.startswith("model.language_model."):
-            return "language_model.model." + config_key[len("model.language_model."):]
-        return "language_model.model." + config_key
-
     errors = []
     skipped = 0
-    for config_key, bits in slq_bits.items():
-        mod_path = _normalize_key(config_key)
-        weight_key = f"{mod_path}.weight"
-        scales_key = f"{mod_path}.scales"
 
-        if weight_key not in weight_shapes or scales_key not in scales_shapes:
+    known_paths = set(weight_shapes.keys()) | set(scales_shapes.keys())
+    for config_key, bits in slq_bits.items():
+        mod_path = _normalize_key(config_key, known_paths)
+
+        # The packed checkpoint may write weights/scales under different prefixes
+        # depending on model architecture (1.7B vs 2B+). Try all candidates.
+        weight_candidates = [
+            f"model.{config_key}.weight",
+            f"language_model.model.{config_key}.weight",
+            f"model.language_model.{config_key}.weight",
+        ]
+        scales_candidates = [
+            f"model.{config_key}.scales",
+            f"language_model.model.{config_key}.scales",
+            f"model.language_model.{config_key}.scales",
+        ]
+        weight_key = None
+        scales_key = None
+        for wc, sc in zip(weight_candidates, scales_candidates):
+            if wc in weight_shapes and sc in scales_shapes:
+                weight_key = wc
+                scales_key = sc
+                break
+
+        if weight_key is None or scales_key is None:
             skipped += 1
             continue
 
@@ -412,6 +453,8 @@ def pack_checkpoint(
     base, tokenizer = load_mlx(model_id, trust_remote_code=True, lazy=True)
     base_params = flatten(base.parameters())
     base_cfg = _base_config(model_id, base)
+    # Build set of known model module paths for key normalization
+    _model_paths = set(name for name, _ in base.named_modules())
 
     if subdir_name:
         out = Path(output_dir) / subdir_name
@@ -459,7 +502,7 @@ def pack_checkpoint(
         # dequantized range, which does not reproduce the GPTQ group scale,
         # and a group whose grid does not span the full [0, 2^bits) range
         # comes back stretched.
-        key = f"model.{name}"
+        key = _normalize_key(name, _model_paths)
         weights[f"{key}.weight"] = mx.array(pack_weight(np.asarray(qw), bits))
         
         # Choose scale dtype with float16 range safety check

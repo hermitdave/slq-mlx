@@ -63,6 +63,9 @@ def parse_args():
     p.add_argument("--calibration-tokens", type=int, default=2**20)
     p.add_argument("--calibration-seq-length", type=int, default=1024)
     p.add_argument("--bitwidths", nargs="+", type=int, default=[2, 3, 4, 5, 6, 8])
+    p.add_argument("--bitwidth-chunks", default=None,
+                   help="Split bitwidths into groups to reduce peak memory, e.g. '2,3,4;5,6,8'. "
+                        "Each group reuses the same calibration/Hessian. Default: all bitwidths at once.")
     p.add_argument("--cal-bitwidth", type=int, default=4)
     p.add_argument("--group-size", type=int, default=64)
     p.add_argument("--sym", action="store_true")
@@ -89,6 +92,32 @@ def main():
     unsupported = [b for b in args.bitwidths if b not in SUPPORTED_BITS]
     if unsupported:
         raise ValueError(f"Unsupported bitwidths {unsupported}; MLX supports {SUPPORTED_BITS}")
+
+    # Parse bitwidth chunks (e.g. "2,3,4;5,6,8")
+    if args.bitwidth_chunks:
+        chunks = []
+        for group in args.bitwidth_chunks.split(";"):
+            group = group.strip()
+            if not group:
+                continue
+            nums = [int(x) for x in group.split(",")]
+            unsupported = [b for b in nums if b not in args.bitwidths]
+            if unsupported:
+                raise ValueError(f"Chunk contains bitwidths not in --bitwidths: {unsupported}")
+            chunks.append(nums)
+        bitwidth_chunks = chunks
+        # Validate chunk sizes and ensure at least 2 passes
+        for chunk in bitwidth_chunks:
+            if len(chunk) not in (1, 2, 3):
+                raise ValueError(f"Each chunk must have 1-3 bitwidths; got {len(chunk)} in {chunk}")
+        if len(bitwidth_chunks) < 2:
+            raise ValueError(f"Need at least 2 chunks for multiple passes; got {len(bitwidth_chunks)}")
+        # Ensure all bitwidths are covered exactly once
+        covered = sorted(bw for chunk in bitwidth_chunks for bw in chunk)
+        if covered != sorted(args.bitwidths):
+            raise ValueError(f"Chunks must cover all bitwidths exactly once: {covered} vs {sorted(args.bitwidths)}")
+    else:
+        bitwidth_chunks = [args.bitwidths]
 
     mx.random.seed(args.seed)
     save_dir = Path(args.save_dir)
@@ -320,11 +349,16 @@ def main():
             for name, handle in handles.items():
                 full_name = f"{args.block_modules}.{block_id}.{name}"
                 quantized = handle.quantize()
-                for bits, (qw, sc, zz) in quantized.items():
-                    layer_save = save_dir / f"{bits}bit" / full_name
-                    save_tasks.append(pool.submit(save_qparams, str(layer_save), bits, qw, sc, zz, handle))
-                    if bits == args.cal_bitwidth:
-                        cal_name, cal_qw, cal_sc, cal_zz, cal_handle = name, qw, sc, zz, handle
+                # Process bitwidths in chunks to reduce peak memory
+                for chunk in bitwidth_chunks:
+                    for bits in chunk:
+                        qw, sc, zz = quantized[bits]
+                        layer_save = save_dir / f"{bits}bit" / full_name
+                        save_tasks.append(pool.submit(save_qparams, str(layer_save), bits, qw, sc, zz, handle))
+                        if bits == args.cal_bitwidth:
+                            cal_name, cal_qw, cal_sc, cal_zz, cal_handle = name, qw, sc, zz, handle
+                        del qw, sc, zz
+                    mx.clear_cache()
 
             # Replace cal_bitwidth weights in model for next-block calibration
             if cal_name is None:
