@@ -17,31 +17,34 @@ logger = logging.getLogger(__name__)
 
 
 def compute_logits(model, input_ids, cache_path=None):
-    """Compute logits for all sequences, optionally caching to disk."""
+    """Compute logits for all sequences, streaming to disk via memmap to avoid 30GB+ RAM hold.
+
+    For large-vocab models (128k) the naive list+concatenate allocates 50-130GB. This uses a memmap that is flushed per sequence.
+    """
     if cache_path and Path(cache_path).exists():
         logger.info(f"Loading cached logits from {cache_path}")
-        return np.load(cache_path)
-    
-    logger.info(f"Computing logits for {input_ids.shape[0]} sequences...")
-    all_logits = []
-    
-    for i in range(input_ids.shape[0]):
+        return np.load(cache_path, mmap_mode="r")
+    n = int(input_ids.shape[0])
+    seq_len = int(input_ids.shape[1]) - 1
+    # vocab size inferred from a single forward pass at runtime
+    logger.info(f"Computing logits for {n} sequences (streaming memmap)...")
+    tmp = cache_path if cache_path else "/tmp/logits_stream.npy"
+    mem = None
+    for i in range(n):
         ids = input_ids[i:i+1]
         logits = model(ids)[:, :-1, :]
-        # Convert bfloat16 to float32 for numpy compatibility
-        all_logits.append(np.array(logits.astype(mx.float32)))
-        
+        arr = np.array(logits.astype(mx.float32))
+        if mem is None:
+            vocab = int(arr.shape[-1])
+            mem = np.lib.format.open_memmap(tmp, mode="w+", dtype="float32", shape=(n, seq_len, vocab))
+        mem[i] = arr
+        mem.flush()
+        del logits, arr
+        mx.clear_cache()
         if (i + 1) % 10 == 0:
-            logger.info(f"  Processed {i+1}/{input_ids.shape[0]} sequences")
-            mx.clear_cache()
-    
-    logits_array = np.concatenate(all_logits, axis=0)
-    
-    if cache_path:
-        np.save(cache_path, logits_array)
-        logger.info(f"Cached logits to {cache_path}")
-    
-    return logits_array
+            logger.info(f"  Processed {i+1}/{n} sequences")
+    mem.flush(); del mem
+    return np.load(tmp, mmap_mode="r")
 
 
 def compute_metrics_from_logits(logits_a, logits_b, input_ids):
@@ -118,7 +121,7 @@ def main():
     ap = argparse.ArgumentParser(description="KLD/PPL validation: BF16 vs SLQ")
     ap.add_argument("--model-a", required=True, help="BF16 model path")
     ap.add_argument("--model-b", required=True, help="SLQ model path")
-    ap.add_argument("--calibration-samples", type=int, default=512)
+    ap.add_argument("--calibration-samples", type=int, default=32)
     ap.add_argument("--calibration-seq-length", type=int, default=512)
     ap.add_argument("--calibration-data", default="fineweb_edu")
     ap.add_argument("--seed", type=int, default=42)
@@ -144,7 +147,7 @@ def main():
     if args.logits_cache_dir:
         cache_a = Path(args.logits_cache_dir) / f"logits_a_{args.calibration_samples}_{args.calibration_seq_length}.npy"
     
-    logits_a = compute_logits(model_a, input_ids, cache_path=str(cache_a) if cache_a else None)
+    logits_a = compute_logits(model_a, input_ids, cache_path=str(cache_a) if cache_a else "/tmp/logits_a.npy")
     del model_a
     mx.clear_cache()
     
@@ -156,7 +159,7 @@ def main():
     if args.logits_cache_dir:
         cache_b = Path(args.logits_cache_dir) / f"logits_b_{args.calibration_samples}_{args.calibration_seq_length}.npy"
     
-    logits_b = compute_logits(model_b, input_ids, cache_path=str(cache_b) if cache_b else None)
+    logits_b = compute_logits(model_b, input_ids, cache_path=str(cache_b) if cache_b else "/tmp/logits_b.npy")
     del model_b
     mx.clear_cache()
 

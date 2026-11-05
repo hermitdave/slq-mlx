@@ -115,7 +115,23 @@ CORPORA = {
 
 
 def get_tokenizer(model_id: str):
-    """Load tokenizer for model."""
+    """Load tokenizer for model — bypass transformers AutoConfig for LFM3 (KeyError: conv)."""
+    if "LFM3" in model_id or "lfm3" in model_id:
+        from tokenizers import Tokenizer
+        from huggingface_hub import hf_hub_download
+        import pathlib
+        if model_id.startswith("/"):
+            tok_json = pathlib.Path(model_id) / "tokenizer.json"
+            if not tok_json.exists():
+                tok_json = pathlib.Path("LiquidAI/LFM3-1.7B") / "tokenizer.json"
+            tokenizer = Tokenizer.from_file(str(tok_json)) if tok_json.exists() else Tokenizer.from_file(hf_hub_download(repo_id="LiquidAI/LFM3-1.7B", filename="tokenizer.json"))
+        else:
+            local = hf_hub_download(repo_id=model_id, filename="tokenizer.json")
+            tokenizer = Tokenizer.from_file(local)
+        class _Tok:
+            def __init__(self, t): self._t = t; self.encode = lambda s: t.encode(s, add_special_tokens=False).ids; self.encode_plus = lambda s, **k: {"input_ids": t.encode(s, add_special_tokens=False).ids}
+            def __getattr__(self, n): return getattr(self._t, n)
+        return _Tok(tokenizer)
     return AutoTokenizer.from_pretrained(model_id, use_fast=True)
 
 
